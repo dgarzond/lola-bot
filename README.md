@@ -1,6 +1,6 @@
-# Price Tracker Agent 🛍️
+# Price Tracker Agent 🛍️ (Telegram)
 
-Agente que trackea precios por WhatsApp. Le dices qué quieres comprar, él busca en Amazon, MediaMarkt, eBay, etc., y te avisa cuando baja el precio.
+Agente que trackea precios por Telegram (multiusuario). Le dices qué quieres comprar, él busca en internet y te avisa cuando baja el precio.
 
 ## Deploy en Railway (10 minutos)
 
@@ -30,23 +30,22 @@ En tu proyecto Railway → **Variables** → añade:
 |---|---|
 | `ANTHROPIC_API_KEY` | tu key de Anthropic |
 | `TAVILY_API_KEY` | tu key de Tavily (gratis en app.tavily.com) |
-| `TWILIO_ACCOUNT_SID` | de console.twilio.com |
-| `TWILIO_AUTH_TOKEN` | de console.twilio.com |
-| `TWILIO_WHATSAPP_FROM` | `whatsapp:+14155238886` |
-| `MY_WHATSAPP` | `whatsapp:+34600000000` |
+| `TELEGRAM_BOT_TOKEN` | token del bot (BotFather) |
 
-### 4. Conecta Twilio con tu Railway URL
+### 4. Crea el bot en Telegram (BotFather)
 
-1. En Railway → tu proyecto → **Settings** → copia la URL pública (ej: `https://price-tracker.up.railway.app`)
-2. Ve a [Twilio Console](https://console.twilio.com) → Messaging → Try it out → Send a WhatsApp message
-3. En **Sandbox Settings** → campo "When a message comes in" → pega:
+1. En Telegram abre `@BotFather`
+2. Ejecuta `/newbot`
+3. Copia el token y guárdalo como `TELEGRAM_BOT_TOKEN` en Railway
+
+### 5. Conecta Telegram con tu Railway URL (setWebhook)
+
+1. En Railway → tu proyecto → copia la URL pública (ej: `https://lola-bot.up.railway.app`)
+2. Abre en tu navegador:
    ```
-   https://price-tracker.up.railway.app/webhook
+   https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://TU_URL.up.railway.app/telegram-webhook
    ```
-
-### 5. Activa el sandbox de Twilio en tu WhatsApp
-
-Twilio te da un código tipo `join <palabra>`. Mándalo desde tu WhatsApp al número del sandbox (+1 415 523 8886).
+3. Si responde `{"ok":true,...}` quedó listo ✅
 
 ---
 
@@ -65,9 +64,9 @@ Twilio te da un código tipo `join <palabra>`. Mándalo desde tu WhatsApp al nú
 ## Arquitectura
 
 ```
-Tu WhatsApp
+Telegram
     ↓ mensaje
-Twilio Sandbox
+Telegram webhook
     ↓ POST
 Railway (Flask webhook) ──→ Claude (parsea intención)
     ↓ guarda en watchlist.json
@@ -75,7 +74,7 @@ APScheduler (cada 6h)
     ↓ Tavily (busca precios)
     ↓ Claude (extrae precios)
     ↓ si bajó precio
-Tu WhatsApp ← Twilio ← Railway
+Telegram ← Railway
 ```
 
 ## Archivos
