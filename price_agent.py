@@ -73,22 +73,27 @@ def search_prices(producto: str, query: str) -> list:
         return []
 
     client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
+    # Búsqueda web general: no restringimos a tiendas concretas.
+    # Usamos variaciones ligeras para aumentar recall sin sesgar a dominios.
     queries = [
-        f"{query} precio Amazon España",
-        f"{query} precio MediaMarkt PCComponentes España",
-        f"{query} precio eBay España oferta",
-        f"{query} precio El Corte Inglés Fnac",
+        query,
+        f"{producto} precio",
+        f"{query} comprar",
+        f"{query} oferta precio",
     ]
 
     seen, results = set(), []
     for q in queries:
         try:
-            for r in client.search(q, max_results=4).get("results", []):
-                if r.get("url") not in seen:
-                    seen.add(r["url"])
+            resp = client.search(q, max_results=6) or {}
+            for r in resp.get("results", []) or []:
+                url = r.get("url")
+                if url and url not in seen:
+                    seen.add(url)
                     results.append(r)
         except Exception:
             pass
+
     return results
 
 def extract_prices_with_claude(producto: str, raw_results: list) -> list:
