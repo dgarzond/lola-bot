@@ -1,5 +1,5 @@
 """
-Price Tracker Agent — WhatsApp + Railway Cloud
+Price Tracker Agent — Telegram + Railway Cloud
 ================================================
 En Railway corre un solo proceso: Flask webhook + APScheduler para el cron.
 No necesitas crontab ni dos terminales.
@@ -13,6 +13,8 @@ Deploy:
 
 import os, json, datetime, sys, threading
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
+import requests
 
 try:
     from dotenv import load_dotenv
@@ -21,7 +23,6 @@ except ImportError:
     pass
 
 import anthropic
-from twilio.rest import Client as TwilioClient
 from flask import Flask, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -35,15 +36,70 @@ def require_env(name: str) -> str:
         raise RuntimeError(f"Missing required env var: {name}")
     return value
 
-# ── Storage ───────────────────────────────────────────────────────────────────
+# ── Telegram ─────────────────────────────────────────────────────────────────
+
+def telegram_send(chat_id: int | str, text: str):
+    token = require_env("TELEGRAM_BOT_TOKEN")
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+    max_chars = int(os.getenv("TELEGRAM_MAX_CHARS", "3500"))
+    t = (text or "").strip()
+    chunks = []
+    while t:
+        chunk = t[:max_chars]
+        cut = chunk.rfind("\n")
+        if cut > 500:
+            chunk = chunk[:cut]
+        chunks.append(chunk.strip())
+        t = t[len(chunk):].lstrip("\n")
+
+    for chunk in chunks or [""]:
+        resp = requests.post(
+            url,
+            json={"chat_id": chat_id, "text": chunk, "disable_web_page_preview": True},
+            timeout=20,
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Telegram sendMessage failed: {resp.status_code} {resp.text[:300]}")
+
+# ── Storage (multiusuario) ────────────────────────────────────────────────────
+
+def _migrate_watchlist_if_needed(data: dict) -> dict:
+    """
+    Formato nuevo (multiusuario):
+      {"<chat_id>": {"<item_id>": {...}}, ...}
+
+    Formato viejo (single-user):
+      {"<item_id>": {...}, ...}
+    """
+    if not isinstance(data, dict) or not data:
+        return {}
+
+    sample_val = next(iter(data.values()))
+    if isinstance(sample_val, dict) and "producto" in sample_val:
+        return {"default": data}
+    return data
 
 def load_watchlist() -> dict:
     if WATCHLIST_FILE.exists():
-        return json.loads(WATCHLIST_FILE.read_text())
+        data = json.loads(WATCHLIST_FILE.read_text())
+        return _migrate_watchlist_if_needed(data)
     return {}
 
 def save_watchlist(data: dict):
     WATCHLIST_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+
+def load_chat_watchlist(chat_key: str) -> dict:
+    data = load_watchlist()
+    wl = data.get(chat_key)
+    if isinstance(wl, dict):
+        return wl
+    return {}
+
+def save_chat_watchlist(chat_key: str, chat_watchlist: dict):
+    data = load_watchlist()
+    data[chat_key] = chat_watchlist
+    save_watchlist(data)
 
 # ── Claude: parsear intención ─────────────────────────────────────────────────
 
@@ -80,7 +136,7 @@ def search_prices(producto: str, query: str) -> list:
     except ImportError:
         return []
 
-    client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
+    client = TavilyClient(api_key=require_env("TAVILY_API_KEY"))
     # Búsqueda web general: no restringimos a tiendas concretas.
     # Usamos variaciones ligeras para aumentar recall sin sesgar a dominios.
     queries = [
@@ -134,18 +190,13 @@ Solo precios numéricos claros. Ordena menor a mayor. Si no hay, devuelve []."""
     except Exception:
         return []
 
-# ── WhatsApp ──────────────────────────────────────────────────────────────────
+# ── Mensajería ────────────────────────────────────────────────────────────────
 
-def send_whatsapp(body: str):
-    client = TwilioClient(
-        require_env("TWILIO_ACCOUNT_SID"),
-        require_env("TWILIO_AUTH_TOKEN")
-    )
-    client.messages.create(
-        from_=require_env("TWILIO_WHATSAPP_FROM"),
-        to=require_env("MY_WHATSAPP"),
-        body=body
-    )
+def send_message(chat_key: str, body: str):
+    # chat_key puede ser "default" por migración de formato antiguo
+    if chat_key == "default":
+        return
+    telegram_send(chat_id=int(chat_key), text=body)
 
 def format_watchlist(watchlist: dict) -> str:
     active = {k: v for k, v in watchlist.items() if v.get("activo", True)}
@@ -167,84 +218,92 @@ def format_watchlist(watchlist: dict) -> str:
 def check_all_prices():
     """Job del scheduler — revisa todos los productos y manda alertas."""
     print(f"⏰ Revisando precios — {datetime.datetime.now().strftime('%H:%M')}")
-    watchlist = load_watchlist()
-    active = {k: v for k, v in watchlist.items() if v.get("activo", True)}
-
-    if not active:
+    all_data = load_watchlist()
+    if not all_data:
         print("   Watchlist vacía.")
         return
 
     now = datetime.datetime.now().isoformat()
 
-    for item_id, item in active.items():
-        print(f"  → {item['producto']}")
-        raw = search_prices(item["producto"], item.get("query_busqueda", item["producto"]))
-        prices = extract_prices_with_claude(item["producto"], raw)
-
-        if not prices:
-            print(f"    Sin precios encontrados")
+    for chat_key, chat_watchlist in all_data.items():
+        if not isinstance(chat_watchlist, dict):
             continue
 
-        best = prices[0]
-        nuevo_precio = best["precio"]
-        prev_precio = item.get("mejor_precio_actual")
+        active = {k: v for k, v in chat_watchlist.items() if isinstance(v, dict) and v.get("activo", True)}
+        if not active:
+            continue
 
-        if "historial" not in item:
-            item["historial"] = []
-        item["historial"].append({
-            "fecha": now,
-            "precio": nuevo_precio,
-            "tienda": best["tienda"],
-            "url": best["url"]
-        })
-        item["mejor_precio_actual"] = nuevo_precio
-        item["mejor_tienda"] = best["tienda"]
-        item["mejor_url"] = best["url"]
-        item["ultima_revision"] = now
+        for item_id, item in active.items():
+            print(f"  → ({chat_key}) {item['producto']}")
+            raw = search_prices(item["producto"], item.get("query_busqueda", item["producto"]))
+            prices = extract_prices_with_claude(item["producto"], raw)
 
-        print(f"    💰 €{nuevo_precio:.2f} en {best['tienda']}")
+            if not prices:
+                print(f"    Sin precios encontrados")
+                continue
 
-        # Alerta si bajó
-        if prev_precio is not None and nuevo_precio < prev_precio:
-            bajada = prev_precio - nuevo_precio
-            pct = (bajada / prev_precio) * 100
-            item_num = list(active.keys()).index(item_id) + 1
-            msg = (
-                f"🔔 *Bajada de precio!*\n\n"
-                f"🛍️ *{item['producto']}*\n"
-                f"💰 *€{nuevo_precio:.2f}* (antes €{prev_precio:.2f})\n"
-                f"📉 Bajó €{bajada:.2f} ({pct:.1f}%)\n"
-                f"🏪 {best['tienda']}\n"
-                f"🔗 {best['url']}\n\n"
-                f"Responde *comprado {item_num}* para dejar de trackear."
-            )
-            send_whatsapp(msg)
-            print(f"    📱 Alerta enviada!")
+            best = prices[0]
+            nuevo_precio = best["precio"]
+            prev_precio = item.get("mejor_precio_actual")
 
-        # Alerta si alcanzó precio objetivo
-        if item.get("precio_objetivo") and nuevo_precio <= item["precio_objetivo"]:
-            msg = (
-                f"🎯 *Precio objetivo alcanzado!*\n\n"
-                f"🛍️ *{item['producto']}*\n"
-                f"💰 *€{nuevo_precio:.2f}* (tu objetivo: €{item['precio_objetivo']})\n"
-                f"🏪 {best['tienda']}\n"
-                f"🔗 {best['url']}"
-            )
-            send_whatsapp(msg)
+            if "historial" not in item:
+                item["historial"] = []
+            item["historial"].append({
+                "fecha": now,
+                "precio": nuevo_precio,
+                "tienda": best["tienda"],
+                "url": best["url"]
+            })
+            item["mejor_precio_actual"] = nuevo_precio
+            item["mejor_tienda"] = best["tienda"]
+            item["mejor_url"] = best["url"]
+            item["ultima_revision"] = now
 
-        watchlist[item_id] = item
+            print(f"    💰 €{nuevo_precio:.2f} en {best['tienda']}")
 
-    save_watchlist(watchlist)
+            # Alerta si bajó
+            if prev_precio is not None and nuevo_precio < prev_precio:
+                bajada = prev_precio - nuevo_precio
+                pct = (bajada / prev_precio) * 100
+                item_num = list(active.keys()).index(item_id) + 1
+                msg = (
+                    f"🔔 Bajada de precio!\n\n"
+                    f"🛍️ {item['producto']}\n"
+                    f"💰 €{nuevo_precio:.2f} (antes €{prev_precio:.2f})\n"
+                    f"📉 Bajó €{bajada:.2f} ({pct:.1f}%)\n"
+                    f"🏪 {best['tienda']}\n"
+                    f"🔗 {best['url']}\n\n"
+                    f"Responde: comprado {item_num}"
+                )
+                send_message(chat_key, msg)
+                print(f"    📱 Alerta enviada!")
+
+            # Alerta si alcanzó precio objetivo
+            if item.get("precio_objetivo") and nuevo_precio <= item["precio_objetivo"]:
+                msg = (
+                    f"🎯 Precio objetivo alcanzado!\n\n"
+                    f"🛍️ {item['producto']}\n"
+                    f"💰 €{nuevo_precio:.2f} (tu objetivo: €{item['precio_objetivo']})\n"
+                    f"🏪 {best['tienda']}\n"
+                    f"🔗 {best['url']}"
+                )
+                send_message(chat_key, msg)
+
+            chat_watchlist[item_id] = item
+
+        all_data[chat_key] = chat_watchlist
+
+    save_watchlist(all_data)
     print(f"   ✅ Revisión completada.")
 
-def check_single_async(item_id: str):
+def check_single_async(chat_key: str, item_id: str):
     """Busca precio inicial de un producto recién agregado."""
     def _run():
         import time; time.sleep(3)
-        watchlist = load_watchlist()
-        if item_id not in watchlist:
+        chat_watchlist = load_chat_watchlist(chat_key)
+        if item_id not in chat_watchlist:
             return
-        item = watchlist[item_id]
+        item = chat_watchlist[item_id]
         raw = search_prices(item["producto"], item.get("query_busqueda", item["producto"]))
         prices = extract_prices_with_claude(item["producto"], raw)
         if prices:
@@ -253,12 +312,13 @@ def check_single_async(item_id: str):
             item["mejor_tienda"] = best["tienda"]
             item["mejor_url"] = best["url"]
             item["historial"] = [{"fecha": datetime.datetime.now().isoformat(), "precio": best["precio"], "tienda": best["tienda"], "url": best["url"]}]
-            watchlist[item_id] = item
-            save_watchlist(watchlist)
-            send_whatsapp(
-                f"✅ *Precio inicial encontrado!*\n\n"
-                f"🛍️ *{item['producto']}*\n"
-                f"💰 Mejor precio ahora: *€{best['precio']:.2f}*\n"
+            chat_watchlist[item_id] = item
+            save_chat_watchlist(chat_key, chat_watchlist)
+            send_message(
+                chat_key,
+                f"✅ Precio inicial encontrado!\n\n"
+                f"🛍️ {item['producto']}\n"
+                f"💰 Mejor precio ahora: €{best['precio']:.2f}\n"
                 f"🏪 {best['tienda']}\n"
                 f"🔗 {best['url']}\n\n"
                 f"Te aviso cuando baje 🔔"
@@ -269,33 +329,46 @@ def check_single_async(item_id: str):
 
 app = Flask(__name__)
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    message = request.form.get("Body", "").strip()
-    print(f"📩 {message}")
+@app.route("/telegram-webhook", methods=["POST"])
+def telegram_webhook():
+    update = request.get_json(silent=True) or {}
+    msg = update.get("message") or update.get("edited_message") or {}
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    text = (msg.get("text") or "").strip()
+
+    if chat_id is None:
+        return "", 204
+
+    chat_key = str(chat_id)
+    print(f"📩 (tg:{chat_key}) {text}")
+
+    if not text:
+        telegram_send(chat_id, "Dime qué quieres comprar, o escribe: listar")
+        return "", 204
 
     try:
-        watchlist = load_watchlist()
-        intent = parse_user_intent(message)
+        chat_watchlist = load_chat_watchlist(chat_key)
+        intent = parse_user_intent(text)
         accion = intent.get("accion", "desconocido")
     except Exception as e:
         print(f"❌ Error inicializando request: {e}")
         try:
-            send_whatsapp(
-                "⚠️ Ahora mismo no puedo procesar tu mensaje porque faltan variables de entorno en el servidor.\n"
-                "Revisa que estén configuradas: ANTHROPIC_API_KEY, TAVILY_API_KEY, TWILIO_*.\n"
-                "Si quieres, te digo exactamente dónde configurarlas en Railway."
+            telegram_send(
+                chat_id,
+                "⚠️ No puedo procesar tu mensaje por configuración faltante.\n"
+                "Revisa variables: ANTHROPIC_API_KEY, TAVILY_API_KEY, TELEGRAM_BOT_TOKEN."
             )
         except Exception as send_err:
-            print(f"❌ También falló enviar WhatsApp: {send_err}")
+            print(f"❌ También falló enviar Telegram: {send_err}")
         return "", 204
 
     if accion == "agregar":
-        producto = intent.get("producto", message)
+        producto = intent.get("producto", text)
         query = intent.get("query_busqueda", producto)
         precio_objetivo = intent.get("precio_objetivo")
         item_id = f"{producto[:30].lower().replace(' ', '-')}-{datetime.date.today().isoformat()}"
-        watchlist[item_id] = {
+        chat_watchlist[item_id] = {
             "producto": producto,
             "query_busqueda": query,
             "precio_objetivo": precio_objetivo,
@@ -304,23 +377,23 @@ def webhook():
             "agregado": datetime.datetime.now().isoformat(),
             "historial": []
         }
-        save_watchlist(watchlist)
+        save_chat_watchlist(chat_key, chat_watchlist)
         obj_str = f"\n🎯 Precio objetivo: €{precio_objetivo}" if precio_objetivo else ""
-        reply = f"👀 Agregado al tracker!\n\n🛍️ *{producto}*{obj_str}\n\nBuscando el mejor precio ahora, te aviso en un momento..."
-        check_single_async(item_id)
+        reply = f"👀 Agregado al tracker!\n\n🛍️ {producto}{obj_str}\n\nBuscando el mejor precio ahora, te aviso en un momento..."
+        check_single_async(chat_key, item_id)
 
     elif accion == "listar":
-        reply = format_watchlist(watchlist)
+        reply = format_watchlist(chat_watchlist)
 
     elif accion in ("comprado", "eliminar"):
         num = intent.get("numero_item")
-        active_keys = [k for k, v in watchlist.items() if v.get("activo", True)]
+        active_keys = [k for k, v in chat_watchlist.items() if v.get("activo", True)]
         if num and 1 <= num <= len(active_keys):
             iid = active_keys[num - 1]
-            nombre = watchlist[iid]["producto"]
-            watchlist[iid]["activo"] = False
-            watchlist[iid]["fecha_compra"] = datetime.date.today().isoformat()
-            save_watchlist(watchlist)
+            nombre = chat_watchlist[iid]["producto"]
+            chat_watchlist[iid]["activo"] = False
+            chat_watchlist[iid]["fecha_compra"] = datetime.date.today().isoformat()
+            save_chat_watchlist(chat_key, chat_watchlist)
             reply = f"🎉 Listo! Dejé de trackear:\n*{nombre}*\n\n¿Qué más quieres buscar?"
         else:
             reply = "⚠️ Dime el número. Escribe *listar* para ver tus productos."
@@ -334,13 +407,16 @@ def webhook():
             "• *eliminar N* — dejar de trackear"
         )
 
-    send_whatsapp(reply)
+    telegram_send(chat_id, reply)
     return "", 204
 
 @app.route("/health", methods=["GET"])
 def health():
-    watchlist = load_watchlist()
-    active = sum(1 for v in watchlist.values() if v.get("activo", True))
+    data = load_watchlist()
+    active = 0
+    for _, chat_watchlist in data.items():
+        if isinstance(chat_watchlist, dict):
+            active += sum(1 for v in chat_watchlist.values() if isinstance(v, dict) and v.get("activo", True))
     return {"status": "ok", "productos_activos": active, "hora": datetime.datetime.now().isoformat()}, 200
 
 # ── Main: arranca Flask + Scheduler juntos ────────────────────────────────────

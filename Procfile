@@ -1,1 +1,1 @@
-web: python price_agent.py webhook
+web: python price_agent.py
