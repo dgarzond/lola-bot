@@ -27,6 +27,14 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 WATCHLIST_FILE = Path(__file__).parent / "watchlist.json"
 
+# ── Config / env ──────────────────────────────────────────────────────────────
+
+def require_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Missing required env var: {name}")
+    return value
+
 # ── Storage ───────────────────────────────────────────────────────────────────
 
 def load_watchlist() -> dict:
@@ -40,7 +48,7 @@ def save_watchlist(data: dict):
 # ── Claude: parsear intención ─────────────────────────────────────────────────
 
 def parse_user_intent(message: str) -> dict:
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    client = anthropic.Anthropic(api_key=require_env("ANTHROPIC_API_KEY"))
     prompt = f"""El usuario mandó este mensaje a un agente de price tracking por WhatsApp:
 "{message}"
 
@@ -100,7 +108,7 @@ def extract_prices_with_claude(producto: str, raw_results: list) -> list:
     if not raw_results:
         return []
 
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    client = anthropic.Anthropic(api_key=require_env("ANTHROPIC_API_KEY"))
     results_text = "\n\n".join([
         f"URL: {r.get('url')}\nTítulo: {r.get('title')}\nContenido: {r.get('content','')[:500]}"
         for r in raw_results
@@ -130,12 +138,12 @@ Solo precios numéricos claros. Ordena menor a mayor. Si no hay, devuelve []."""
 
 def send_whatsapp(body: str):
     client = TwilioClient(
-        os.environ["TWILIO_ACCOUNT_SID"],
-        os.environ["TWILIO_AUTH_TOKEN"]
+        require_env("TWILIO_ACCOUNT_SID"),
+        require_env("TWILIO_AUTH_TOKEN")
     )
     client.messages.create(
-        from_=os.environ["TWILIO_WHATSAPP_FROM"],
-        to=os.environ["MY_WHATSAPP"],
+        from_=require_env("TWILIO_WHATSAPP_FROM"),
+        to=require_env("MY_WHATSAPP"),
         body=body
     )
 
@@ -266,9 +274,21 @@ def webhook():
     message = request.form.get("Body", "").strip()
     print(f"📩 {message}")
 
-    watchlist = load_watchlist()
-    intent = parse_user_intent(message)
-    accion = intent.get("accion", "desconocido")
+    try:
+        watchlist = load_watchlist()
+        intent = parse_user_intent(message)
+        accion = intent.get("accion", "desconocido")
+    except Exception as e:
+        print(f"❌ Error inicializando request: {e}")
+        try:
+            send_whatsapp(
+                "⚠️ Ahora mismo no puedo procesar tu mensaje porque faltan variables de entorno en el servidor.\n"
+                "Revisa que estén configuradas: ANTHROPIC_API_KEY, TAVILY_API_KEY, TWILIO_*.\n"
+                "Si quieres, te digo exactamente dónde configurarlas en Railway."
+            )
+        except Exception as send_err:
+            print(f"❌ También falló enviar WhatsApp: {send_err}")
+        return "", 204
 
     if accion == "agregar":
         producto = intent.get("producto", message)
