@@ -16,6 +16,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 import requests
 import redis
+from redis.exceptions import AuthenticationError, RedisError
 
 try:
     from dotenv import load_dotenv
@@ -51,8 +52,20 @@ def get_redis():
         _redis_client = None
         return None
 
-    _redis_client = redis.Redis.from_url(redis_url, decode_responses=True)
-    return _redis_client
+    try:
+        client = redis.Redis.from_url(redis_url, decode_responses=True)
+        # Valida credenciales/conectividad ahora (evita 500 en runtime).
+        client.ping()
+        _redis_client = client
+        return _redis_client
+    except AuthenticationError as e:
+        print(f"❌ Redis auth error (check REDIS_URL): {e}")
+        _redis_client = None
+        return None
+    except RedisError as e:
+        print(f"❌ Redis error (check REDIS_URL/network): {e}")
+        _redis_client = None
+        return None
 
 def _redis_watchlist_key(chat_key: str) -> str:
     return f"watchlist:{chat_key}"
@@ -113,7 +126,8 @@ def load_watchlist() -> dict:
                 raw = r.get(_redis_watchlist_key(chat_key))
                 if raw:
                     data[str(chat_key)] = json.loads(raw)
-        except Exception:
+        except Exception as e:
+            print(f"❌ Redis load_watchlist failed, falling back to file: {e}")
             return {}
         return data
 
@@ -126,14 +140,17 @@ def save_watchlist(data: dict):
     r = get_redis()
     if r is not None:
         # Guardado “best-effort”: escribe por chat para que el scheduler lo recorra luego.
-        pipe = r.pipeline()
-        for chat_key, chat_watchlist in (data or {}).items():
-            if not isinstance(chat_watchlist, dict):
-                continue
-            pipe.sadd(REDIS_CHATS_KEY, str(chat_key))
-            pipe.set(_redis_watchlist_key(str(chat_key)), json.dumps(chat_watchlist, ensure_ascii=False))
-        pipe.execute()
-        return
+        try:
+            pipe = r.pipeline()
+            for chat_key, chat_watchlist in (data or {}).items():
+                if not isinstance(chat_watchlist, dict):
+                    continue
+                pipe.sadd(REDIS_CHATS_KEY, str(chat_key))
+                pipe.set(_redis_watchlist_key(str(chat_key)), json.dumps(chat_watchlist, ensure_ascii=False))
+            pipe.execute()
+            return
+        except Exception as e:
+            print(f"❌ Redis save_watchlist failed, falling back to file: {e}")
 
     WATCHLIST_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
 
@@ -146,7 +163,8 @@ def load_chat_watchlist(chat_key: str) -> dict:
                 return {}
             wl = json.loads(raw)
             return wl if isinstance(wl, dict) else {}
-        except Exception:
+        except Exception as e:
+            print(f"❌ Redis load_chat_watchlist failed, falling back to file: {e}")
             return {}
 
     data = load_watchlist()
@@ -162,8 +180,8 @@ def save_chat_watchlist(chat_key: str, chat_watchlist: dict):
             r.sadd(REDIS_CHATS_KEY, str(chat_key))
             r.set(_redis_watchlist_key(chat_key), json.dumps(chat_watchlist or {}, ensure_ascii=False))
             return
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"❌ Redis save_chat_watchlist failed, falling back to file: {e}")
 
     data = load_watchlist()
     data[chat_key] = chat_watchlist
