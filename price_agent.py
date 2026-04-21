@@ -200,7 +200,8 @@ Responde SOLO con JSON (sin markdown):
   "producto": "nombre del producto con todos los detalles relevantes",
   "precio_objetivo": null o número en euros,
   "numero_item": null o número (si dice 'comprado 2' o 'eliminar 3'),
-  "query_busqueda": "query optimizada para buscar precio en Google Shopping"
+  "query_busqueda": "query optimizada para buscar precio en Google Shopping",
+  "periodicidad_horas": null o número (si el usuario dice 'cada 12 horas', 'revisar diario', etc.; default null)
 }}"""
 
     resp = client.messages.create(
@@ -310,6 +311,7 @@ def check_all_prices():
         return
 
     now = datetime.datetime.now().isoformat()
+    now_dt = datetime.datetime.now(datetime.timezone.utc)
 
     for chat_key, chat_watchlist in all_data.items():
         if not isinstance(chat_watchlist, dict):
@@ -321,6 +323,24 @@ def check_all_prices():
 
         for item_id, item in active.items():
             print(f"  → ({chat_key}) {item['producto']}")
+
+            # Respetar periodicidad por item (si está definida)
+            try:
+                periodicidad_h = item.get("periodicidad_horas")
+                if periodicidad_h:
+                    last_iso = item.get("ultima_revision")
+                    if last_iso:
+                        last_dt = datetime.datetime.fromisoformat(last_iso)
+                        # si no tiene tz, asumimos UTC
+                        if last_dt.tzinfo is None:
+                            last_dt = last_dt.replace(tzinfo=datetime.timezone.utc)
+                        due_at = last_dt + datetime.timedelta(hours=float(periodicidad_h))
+                        if now_dt < due_at:
+                            continue
+            except Exception:
+                # Si falla el parseo, no bloqueamos el chequeo.
+                pass
+
             raw = search_prices(item["producto"], item.get("query_busqueda", item["producto"]))
             prices = extract_prices_with_claude(item["producto"], raw)
 
@@ -453,11 +473,13 @@ def telegram_webhook():
         producto = intent.get("producto", text)
         query = intent.get("query_busqueda", producto)
         precio_objetivo = intent.get("precio_objetivo")
+        periodicidad_horas = intent.get("periodicidad_horas")
         item_id = f"{producto[:30].lower().replace(' ', '-')}-{datetime.date.today().isoformat()}"
         chat_watchlist[item_id] = {
             "producto": producto,
             "query_busqueda": query,
             "precio_objetivo": precio_objetivo,
+            "periodicidad_horas": periodicidad_horas,
             "mejor_precio_actual": None,
             "activo": True,
             "agregado": datetime.datetime.now().isoformat(),
