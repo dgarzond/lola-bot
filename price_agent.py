@@ -72,6 +72,9 @@ def _redis_watchlist_key(chat_key: str) -> str:
 
 REDIS_CHATS_KEY = "watchlist:chats"
 
+def _redis_pending_key(chat_key: str) -> str:
+    return f"pending_add:{chat_key}"
+
 # ── Telegram ─────────────────────────────────────────────────────────────────
 
 def telegram_send(chat_id: int | str, text: str):
@@ -186,6 +189,81 @@ def save_chat_watchlist(chat_key: str, chat_watchlist: dict):
     data = load_watchlist()
     data[chat_key] = chat_watchlist
     save_watchlist(data)
+
+def load_pending_add(chat_key: str) -> dict | None:
+    r = get_redis()
+    if r is not None:
+        try:
+            raw = r.get(_redis_pending_key(chat_key))
+            if not raw:
+                return None
+            val = json.loads(raw)
+            return val if isinstance(val, dict) else None
+        except Exception as e:
+            print(f"❌ Redis load_pending_add failed: {e}")
+            return None
+
+    data = load_watchlist()
+    pending = None
+    if isinstance(data.get("__pending__"), dict):
+        pending = data["__pending__"].get(chat_key)
+    return pending if isinstance(pending, dict) else None
+
+def save_pending_add(chat_key: str, payload: dict | None):
+    r = get_redis()
+    if r is not None:
+        try:
+            if payload is None:
+                r.delete(_redis_pending_key(chat_key))
+            else:
+                r.set(_redis_pending_key(chat_key), json.dumps(payload, ensure_ascii=False))
+            return
+        except Exception as e:
+            print(f"❌ Redis save_pending_add failed: {e}")
+
+    data = load_watchlist()
+    if "__pending__" not in data or not isinstance(data.get("__pending__"), dict):
+        data["__pending__"] = {}
+    if payload is None:
+        data["__pending__"].pop(chat_key, None)
+    else:
+        data["__pending__"][chat_key] = payload
+    save_watchlist(data)
+
+def parse_periodicidad_horas_from_text(text: str) -> float | None:
+    """
+    Acepta entradas como:
+    - "6"
+    - "cada 12 horas"
+    - "diario" / "diaria" (24)
+    - "cada día" (24)
+    - "semanal" (168)
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return None
+
+    if t.isdigit():
+        n = float(t)
+        return n if n > 0 else None
+
+    if "diar" in t or "cada día" in t or "cada dia" in t:
+        return 24.0
+    if "seman" in t:
+        return 24.0 * 7
+
+    import re
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*(h|hora|horas)\b", t)
+    if m:
+        val = float(m.group(1).replace(",", "."))
+        return val if val > 0 else None
+
+    m = re.search(r"cada\s+(\d+(?:[.,]\d+)?)\b", t)
+    if m:
+        val = float(m.group(1).replace(",", "."))
+        return val if val > 0 else None
+
+    return None
 
 # ── Claude: parsear intención ─────────────────────────────────────────────────
 
@@ -453,6 +531,51 @@ def telegram_webhook():
         telegram_send(chat_id, "Dime qué quieres comprar, o escribe: listar")
         return "", 204
 
+    # Si hay un alta pendiente, esta respuesta se interpreta como periodicidad
+    pending = load_pending_add(chat_key)
+    if pending is not None:
+        periodicidad_h = parse_periodicidad_horas_from_text(text)
+        if not periodicidad_h:
+            telegram_send(
+                chat_id,
+                "¿Cada cuántas horas quieres que lo revise? Ejemplos: 6, 12, 24 (diario)."
+            )
+            return "", 204
+
+        # Completa el alta pendiente
+        producto = pending.get("producto")
+        query = pending.get("query_busqueda") or producto
+        precio_objetivo = pending.get("precio_objetivo")
+        if not producto:
+            save_pending_add(chat_key, None)
+            telegram_send(chat_id, "Se perdió el producto pendiente. Repite el mensaje con el producto.")
+            return "", 204
+
+        item_id = f"{str(producto)[:30].lower().replace(' ', '-')}-{datetime.date.today().isoformat()}"
+        chat_watchlist = load_chat_watchlist(chat_key)
+        chat_watchlist[item_id] = {
+            "producto": producto,
+            "query_busqueda": query,
+            "precio_objetivo": precio_objetivo,
+            "periodicidad_horas": periodicidad_h,
+            "mejor_precio_actual": None,
+            "activo": True,
+            "agregado": datetime.datetime.now().isoformat(),
+            "historial": []
+        }
+        save_chat_watchlist(chat_key, chat_watchlist)
+        save_pending_add(chat_key, None)
+
+        obj_str = f"\n🎯 Precio objetivo: €{precio_objetivo}" if precio_objetivo else ""
+        reply = (
+            f"✅ Listo! Lo voy a revisar cada {periodicidad_h:g}h.\n\n"
+            f"🛍️ {producto}{obj_str}\n\n"
+            "Buscando el mejor precio ahora, te aviso en un momento..."
+        )
+        telegram_send(chat_id, reply)
+        check_single_async(chat_key, item_id)
+        return "", 204
+
     try:
         chat_watchlist = load_chat_watchlist(chat_key)
         intent = parse_user_intent(text)
@@ -474,6 +597,21 @@ def telegram_webhook():
         query = intent.get("query_busqueda", producto)
         precio_objetivo = intent.get("precio_objetivo")
         periodicidad_horas = intent.get("periodicidad_horas")
+
+        if not periodicidad_horas:
+            # No guardamos aún; pedimos periodicidad y guardamos el "pendiente"
+            save_pending_add(chat_key, {
+                "producto": producto,
+                "query_busqueda": query,
+                "precio_objetivo": precio_objetivo,
+            })
+            telegram_send(
+                chat_id,
+                "¿Cada cuántas horas quieres que lo revise?\n"
+                "Responde solo con un número (ej: 6, 12, 24) o 'diario'."
+            )
+            return "", 204
+
         item_id = f"{producto[:30].lower().replace(' ', '-')}-{datetime.date.today().isoformat()}"
         chat_watchlist[item_id] = {
             "producto": producto,
