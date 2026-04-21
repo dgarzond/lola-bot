@@ -4,3 +4,4 @@ tavily-python
 python-dotenv
 apscheduler
 requests
+redis

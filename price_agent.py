@@ -15,6 +15,7 @@ import os, json, datetime, sys, threading
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 import requests
+import redis
 
 try:
     from dotenv import load_dotenv
@@ -35,6 +36,28 @@ def require_env(name: str) -> str:
     if not value:
         raise RuntimeError(f"Missing required env var: {name}")
     return value
+
+# ── Redis (optional) ──────────────────────────────────────────────────────────
+
+_redis_client = None
+
+def get_redis():
+    global _redis_client
+    if _redis_client is not None:
+        return _redis_client
+
+    redis_url = os.getenv("REDIS_URL")
+    if not redis_url:
+        _redis_client = None
+        return None
+
+    _redis_client = redis.Redis.from_url(redis_url, decode_responses=True)
+    return _redis_client
+
+def _redis_watchlist_key(chat_key: str) -> str:
+    return f"watchlist:{chat_key}"
+
+REDIS_CHATS_KEY = "watchlist:chats"
 
 # ── Telegram ─────────────────────────────────────────────────────────────────
 
@@ -81,15 +104,51 @@ def _migrate_watchlist_if_needed(data: dict) -> dict:
     return data
 
 def load_watchlist() -> dict:
+    r = get_redis()
+    if r is not None:
+        data = {}
+        try:
+            chat_keys = r.smembers(REDIS_CHATS_KEY) or set()
+            for chat_key in chat_keys:
+                raw = r.get(_redis_watchlist_key(chat_key))
+                if raw:
+                    data[str(chat_key)] = json.loads(raw)
+        except Exception:
+            return {}
+        return data
+
     if WATCHLIST_FILE.exists():
         data = json.loads(WATCHLIST_FILE.read_text())
         return _migrate_watchlist_if_needed(data)
     return {}
 
 def save_watchlist(data: dict):
+    r = get_redis()
+    if r is not None:
+        # Guardado “best-effort”: escribe por chat para que el scheduler lo recorra luego.
+        pipe = r.pipeline()
+        for chat_key, chat_watchlist in (data or {}).items():
+            if not isinstance(chat_watchlist, dict):
+                continue
+            pipe.sadd(REDIS_CHATS_KEY, str(chat_key))
+            pipe.set(_redis_watchlist_key(str(chat_key)), json.dumps(chat_watchlist, ensure_ascii=False))
+        pipe.execute()
+        return
+
     WATCHLIST_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
 
 def load_chat_watchlist(chat_key: str) -> dict:
+    r = get_redis()
+    if r is not None:
+        try:
+            raw = r.get(_redis_watchlist_key(chat_key))
+            if not raw:
+                return {}
+            wl = json.loads(raw)
+            return wl if isinstance(wl, dict) else {}
+        except Exception:
+            return {}
+
     data = load_watchlist()
     wl = data.get(chat_key)
     if isinstance(wl, dict):
@@ -97,6 +156,15 @@ def load_chat_watchlist(chat_key: str) -> dict:
     return {}
 
 def save_chat_watchlist(chat_key: str, chat_watchlist: dict):
+    r = get_redis()
+    if r is not None:
+        try:
+            r.sadd(REDIS_CHATS_KEY, str(chat_key))
+            r.set(_redis_watchlist_key(chat_key), json.dumps(chat_watchlist or {}, ensure_ascii=False))
+            return
+        except Exception:
+            pass
+
     data = load_watchlist()
     data[chat_key] = chat_watchlist
     save_watchlist(data)
