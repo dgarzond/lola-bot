@@ -358,18 +358,20 @@ Reglas:
         return []
 
 def _strip_tracking_params_in_text(text: str) -> str:
-    # Reduce URLs gigantes (utm/gclid/etc) en el texto del usuario.
-    out = []
-    for tok in (text or "").split():
-        if tok.startswith("http://") or tok.startswith("https://"):
-            try:
-                parts = urlsplit(tok.strip())
-                out.append(urlunsplit((parts.scheme, parts.netloc, parts.path, "", "")))
-            except Exception:
-                out.append(tok)
-        else:
-            out.append(tok)
-    return " ".join(out).strip()
+    # Reduce URLs gigantes (utm/gclid/etc) sin romper saltos de línea.
+    t = (text or "")
+
+    def _repl(m):
+        url = m.group(0)
+        try:
+            parts = urlsplit(url.strip())
+            return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+        except Exception:
+            return url
+
+    # Reemplaza solo URLs http(s)://... manteniendo el resto del texto intacto.
+    t = re.sub(r"https?://\S+", _repl, t)
+    return t.strip()
 
 def _basic_command_intent(text: str) -> str | None:
     t = (text or "").strip().lower()
