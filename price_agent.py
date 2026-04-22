@@ -79,6 +79,12 @@ def _redis_pending_key(chat_key: str) -> str:
 def _redis_pending_batch_key(chat_key: str) -> str:
     return f"pending_batch:{chat_key}"
 
+def _redis_settings_key(chat_key: str) -> str:
+    return f"settings:{chat_key}"
+
+def _redis_pending_location_key(chat_key: str) -> str:
+    return f"pending_location:{chat_key}"
+
 # ── Telegram ─────────────────────────────────────────────────────────────────
 
 def telegram_send(chat_id: int | str, text: str):
@@ -192,6 +198,81 @@ def save_chat_watchlist(chat_key: str, chat_watchlist: dict):
 
     data = load_watchlist()
     data[chat_key] = chat_watchlist
+    save_watchlist(data)
+
+def load_chat_settings(chat_key: str) -> dict:
+    """
+    Preferencias por chat (ej. ubicación de búsqueda).
+    """
+    r = get_redis()
+    if r is not None:
+        try:
+            raw = r.get(_redis_settings_key(chat_key))
+            if not raw:
+                return {}
+            val = json.loads(raw)
+            return val if isinstance(val, dict) else {}
+        except Exception as e:
+            print(f"❌ Redis load_chat_settings failed: {e}")
+            return {}
+
+    data = load_watchlist()
+    settings_root = data.get("__settings__") if isinstance(data.get("__settings__"), dict) else {}
+    val = settings_root.get(chat_key) if isinstance(settings_root, dict) else None
+    return val if isinstance(val, dict) else {}
+
+def save_chat_settings(chat_key: str, settings: dict):
+    r = get_redis()
+    if r is not None:
+        try:
+            r.set(_redis_settings_key(chat_key), json.dumps(settings or {}, ensure_ascii=False))
+            return
+        except Exception as e:
+            print(f"❌ Redis save_chat_settings failed: {e}")
+
+    data = load_watchlist()
+    if "__settings__" not in data or not isinstance(data.get("__settings__"), dict):
+        data["__settings__"] = {}
+    data["__settings__"][chat_key] = settings or {}
+    save_watchlist(data)
+
+def load_pending_location(chat_key: str) -> dict | None:
+    r = get_redis()
+    if r is not None:
+        try:
+            raw = r.get(_redis_pending_location_key(chat_key))
+            if not raw:
+                return None
+            val = json.loads(raw)
+            return val if isinstance(val, dict) else None
+        except Exception as e:
+            print(f"❌ Redis load_pending_location failed: {e}")
+            return None
+
+    data = load_watchlist()
+    pending_root = data.get("__pending_location__") if isinstance(data.get("__pending_location__"), dict) else {}
+    val = pending_root.get(chat_key) if isinstance(pending_root, dict) else None
+    return val if isinstance(val, dict) else None
+
+def save_pending_location(chat_key: str, payload: dict | None):
+    r = get_redis()
+    if r is not None:
+        try:
+            if payload is None:
+                r.delete(_redis_pending_location_key(chat_key))
+            else:
+                r.set(_redis_pending_location_key(chat_key), json.dumps(payload, ensure_ascii=False))
+            return
+        except Exception as e:
+            print(f"❌ Redis save_pending_location failed: {e}")
+
+    data = load_watchlist()
+    if "__pending_location__" not in data or not isinstance(data.get("__pending_location__"), dict):
+        data["__pending_location__"] = {}
+    if payload is None:
+        data["__pending_location__"].pop(chat_key, None)
+    else:
+        data["__pending_location__"][chat_key] = payload
     save_watchlist(data)
 
 def load_pending_add(chat_key: str) -> dict | None:
@@ -384,6 +465,8 @@ def _basic_command_intent(text: str) -> str | None:
     # comprado/eliminar con número
     if re.match(r"^(comprado|eliminar)\s+\d+\s*$", t):
         return t.split()[0]
+    if t.startswith("ubicacion ") or t.startswith("ubicación "):
+        return "ubicacion"
     return None
 
 def normalize_user_message(text: str) -> dict:
@@ -407,6 +490,9 @@ def normalize_user_message(text: str) -> dict:
         n = int(clean.split()[1])
         return {"kind": "command", "command": cmd, "number": n, "clean_text": clean}
     if cmd:
+        if cmd == "ubicacion":
+            loc = clean.split(" ", 1)[1].strip() if " " in clean else ""
+            return {"kind": "command", "command": cmd, "number": None, "clean_text": clean, "location": loc}
         return {"kind": "command", "command": cmd, "number": None, "clean_text": clean}
 
     if _looks_like_list_message(clean):
@@ -503,7 +589,7 @@ Responde SOLO con JSON (sin markdown):
 
 # ── Buscar precios ────────────────────────────────────────────────────────────
 
-def search_prices(producto: str, query: str) -> list:
+def search_prices(producto: str, query: str, location: str | None = None) -> list:
     try:
         from tavily import TavilyClient
     except ImportError:
@@ -512,11 +598,16 @@ def search_prices(producto: str, query: str) -> list:
     client = TavilyClient(api_key=require_env("TAVILY_API_KEY"))
     # Búsqueda web general: no restringimos a tiendas concretas.
     # Usamos variaciones ligeras para aumentar recall sin sesgar a dominios.
+    # Ubicación (si existe) para sesgar resultados a país/ciudad/region.
+    # Se agrega como término, sin forzar dominios.
+    loc = (location or "").strip()
+    loc_suffix = f" {loc}" if loc else ""
+
     queries = [
-        query,
-        f"{producto} precio",
-        f"{query} comprar",
-        f"{query} oferta precio",
+        f"{query}{loc_suffix}".strip(),
+        f"{producto} precio{loc_suffix}".strip(),
+        f"{query} comprar{loc_suffix}".strip(),
+        f"{query} oferta precio{loc_suffix}".strip(),
     ]
 
     seen, results = set(), []
@@ -603,6 +694,9 @@ def check_all_prices():
         if not isinstance(chat_watchlist, dict):
             continue
 
+        settings = load_chat_settings(str(chat_key))
+        location = settings.get("search_location")
+
         active = {k: v for k, v in chat_watchlist.items() if isinstance(v, dict) and v.get("activo", True)}
         if not active:
             continue
@@ -627,7 +721,8 @@ def check_all_prices():
                 # Si falla el parseo, no bloqueamos el chequeo.
                 pass
 
-            raw = search_prices(item["producto"], item.get("query_busqueda", item["producto"]))
+            # sesgo por ubicación
+            raw = search_prices(item["producto"], item.get("query_busqueda", item["producto"]), location=location)
             prices = extract_prices_with_claude(item["producto"], raw)
 
             if not prices:
@@ -696,7 +791,9 @@ def check_single_async(chat_key: str, item_id: str):
         if item_id not in chat_watchlist:
             return
         item = chat_watchlist[item_id]
-        raw = search_prices(item["producto"], item.get("query_busqueda", item["producto"]))
+        settings = load_chat_settings(chat_key)
+        location = settings.get("search_location")
+        raw = search_prices(item["producto"], item.get("query_busqueda", item["producto"]), location=location)
         prices = extract_prices_with_claude(item["producto"], raw)
         if prices:
             best = prices[0]
@@ -742,6 +839,26 @@ def telegram_webhook():
     # 1) Normalización previa (sin LLM)
     norm = normalize_user_message(text)
     clean_text = norm["clean_text"]
+
+    # Si falta ubicación, preguntamos una vez y reanudamos luego
+    pending_loc = load_pending_location(chat_key)
+    if pending_loc is not None:
+        loc = clean_text.strip()
+        if not loc:
+            telegram_send(chat_id, "¿En qué país/ciudad/region quieres que busque? Ej: España, Madrid, UE.")
+            return "", 204
+        settings = load_chat_settings(chat_key)
+        settings["search_location"] = loc
+        save_chat_settings(chat_key, settings)
+        original = pending_loc.get("original_text")
+        save_pending_location(chat_key, None)
+        if isinstance(original, str) and original.strip():
+            # re-procesa el mensaje original
+            norm = normalize_user_message(original)
+            clean_text = norm["clean_text"]
+        else:
+            telegram_send(chat_id, f"✅ Ok, voy a priorizar resultados en: {loc}")
+            return "", 204
 
     # Si hay un batch pendiente, este mensaje es parte del flujo (confirmación / periodicidad)
     pending_batch = load_pending_batch(chat_key)
@@ -906,9 +1023,25 @@ def telegram_webhook():
                 "Si mandas un listado (varias líneas), lo agrego en lote."
             )
             return "", 204
+        if cmd == "ubicacion":
+            loc = (norm.get("location") or "").strip()
+            if not loc:
+                telegram_send(chat_id, "Usa: `ubicacion España` (o `ubicacion Madrid`).")
+                return "", 204
+            settings = load_chat_settings(chat_key)
+            settings["search_location"] = loc
+            save_chat_settings(chat_key, settings)
+            telegram_send(chat_id, f"✅ Ubicación guardada. Voy a priorizar resultados en: {loc}")
+            return "", 204
 
     # 3) Batch detection (sin LLM para la intención; sí LLM para extraer items)
     if norm["kind"] == "batch":
+        settings = load_chat_settings(chat_key)
+        if not settings.get("search_location"):
+            save_pending_location(chat_key, {"original_text": clean_text})
+            telegram_send(chat_id, "¿En qué país/ciudad/region quieres que busque estos productos? Ej: España.")
+            return "", 204
+
         items = parse_batch_items_with_claude(clean_text)
         if not items:
             telegram_send(chat_id, "No pude extraer los productos del listado. ¿Puedes enviarlos uno por línea?")
@@ -944,6 +1077,12 @@ def telegram_webhook():
         return "", 204
 
     if accion == "agregar":
+        settings = load_chat_settings(chat_key)
+        if not settings.get("search_location"):
+            save_pending_location(chat_key, {"original_text": clean_text})
+            telegram_send(chat_id, "¿En qué país/ciudad/region quieres que busque? Ej: España, Madrid, UE.")
+            return "", 204
+
         producto = intent.get("producto", clean_text)
         query = intent.get("query_busqueda", producto)
         precio_objetivo = intent.get("precio_objetivo")
