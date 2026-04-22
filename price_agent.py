@@ -17,6 +17,7 @@ from urllib.parse import urlsplit, urlunsplit
 import requests
 import redis
 from redis.exceptions import AuthenticationError, RedisError
+import re
 
 try:
     from dotenv import load_dotenv
@@ -74,6 +75,9 @@ REDIS_CHATS_KEY = "watchlist:chats"
 
 def _redis_pending_key(chat_key: str) -> str:
     return f"pending_add:{chat_key}"
+
+def _redis_pending_batch_key(chat_key: str) -> str:
+    return f"pending_batch:{chat_key}"
 
 # ── Telegram ─────────────────────────────────────────────────────────────────
 
@@ -264,6 +268,208 @@ def parse_periodicidad_horas_from_text(text: str) -> float | None:
         return val if val > 0 else None
 
     return None
+
+def parse_periodicidad_map_from_text(text: str) -> dict[int, float] | None:
+    """
+    Parse inputs tipo:
+      "1:12 2:24"
+      "1=6h, 2=12h"
+      "1: diario 2: semanal"
+    Devuelve {1: 12.0, 2: 24.0} o None si no aplica.
+    """
+    import re
+    t = (text or "").strip().lower()
+    if not t:
+        return None
+
+    pairs = re.findall(r"(\d+)\s*[:=]\s*([^,;\n]+)", t)
+    if not pairs:
+        return None
+
+    out: dict[int, float] = {}
+    for idx_s, val_s in pairs:
+        idx = int(idx_s)
+        h = parse_periodicidad_horas_from_text(val_s.strip())
+        if h:
+            out[idx] = h
+    return out or None
+
+def _looks_like_list_message(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    if len(lines) >= 3:
+        return True
+    # heurística: muchos separadores tipo "-" / "•" / numeración
+    bulletish = sum(1 for ln in lines if ln[:2] in ("- ", "* ") or ln.startswith("•") or ln[:2].isdigit())
+    return bulletish >= 2
+
+def parse_batch_items_with_claude(message: str) -> list[dict]:
+    """
+    Extrae ítems de un listado. Cada item debe traer al menos "producto".
+    Opcionalmente: url, precio_objetivo, query_busqueda.
+    """
+    client = anthropic.Anthropic(api_key=require_env("ANTHROPIC_API_KEY"))
+    prompt = f"""El usuario envió un listado de cosas para trackear (posible multi-línea):
+\"\"\"{message}\"\"\"
+
+Extrae items. Responde SOLO JSON array (sin markdown):
+[
+  {{
+    "producto": "texto corto del producto con atributos (talle/color)",
+    "precio_objetivo": null o número en euros si aparece,
+    "url": null o string si aparece,
+    "query_busqueda": "query optimizada para buscar el mejor precio"
+  }}
+]
+
+Reglas:
+- Un item por línea/entrada del usuario (si es posible).
+- Si hay URL pegada sin https, normalízala agregando https://
+- Si no hay precio objetivo, usa null.
+- No inventes productos.
+"""
+    resp = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1200,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    text = resp.content[0].text.strip().strip("```json").strip("```").strip()
+    try:
+        arr = json.loads(text)
+        if not isinstance(arr, list):
+            return []
+        cleaned = []
+        for it in arr:
+            if not isinstance(it, dict):
+                continue
+            producto = (it.get("producto") or "").strip()
+            if not producto:
+                continue
+            cleaned.append({
+                "producto": producto,
+                "precio_objetivo": it.get("precio_objetivo"),
+                "url": it.get("url"),
+                "query_busqueda": it.get("query_busqueda") or producto,
+            })
+        return cleaned
+    except Exception:
+        return []
+
+def _strip_tracking_params_in_text(text: str) -> str:
+    # Reduce URLs gigantes (utm/gclid/etc) en el texto del usuario.
+    out = []
+    for tok in (text or "").split():
+        if tok.startswith("http://") or tok.startswith("https://"):
+            try:
+                parts = urlsplit(tok.strip())
+                out.append(urlunsplit((parts.scheme, parts.netloc, parts.path, "", "")))
+            except Exception:
+                out.append(tok)
+        else:
+            out.append(tok)
+    return " ".join(out).strip()
+
+def _basic_command_intent(text: str) -> str | None:
+    t = (text or "").strip().lower()
+    if not t:
+        return None
+    if t in ("listar", "/listar", "lista", "ver", "ver lista"):
+        return "listar"
+    if t in ("help", "/help", "ayuda", "/start", "start"):
+        return "ayuda"
+    # comprado/eliminar con número
+    if re.match(r"^(comprado|eliminar)\s+\d+\s*$", t):
+        return t.split()[0]
+    return None
+
+def normalize_user_message(text: str) -> dict:
+    """
+    Capa previa: intenta entender el mensaje SIN LLM.
+    Devuelve:
+      {
+        "kind": "command"|"batch"|"single"|"empty",
+        "command": "listar"|"ayuda"|"comprado"|"eliminar"|None,
+        "number": int|None,
+        "clean_text": str,
+      }
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return {"kind": "empty", "command": None, "number": None, "clean_text": ""}
+
+    clean = _strip_tracking_params_in_text(raw)
+    cmd = _basic_command_intent(clean)
+    if cmd in ("comprado", "eliminar"):
+        n = int(clean.split()[1])
+        return {"kind": "command", "command": cmd, "number": n, "clean_text": clean}
+    if cmd:
+        return {"kind": "command", "command": cmd, "number": None, "clean_text": clean}
+
+    if _looks_like_list_message(clean):
+        return {"kind": "batch", "command": None, "number": None, "clean_text": clean}
+
+    return {"kind": "single", "command": None, "number": None, "clean_text": clean}
+
+def coerce_llm_intent(intent: dict, fallback_text: str) -> dict:
+    """
+    Valida/normaliza salida del LLM para evitar estados raros.
+    """
+    if not isinstance(intent, dict):
+        return {"accion": "desconocido"}
+    accion = intent.get("accion") if intent.get("accion") in ("agregar", "eliminar", "listar", "comprado", "desconocido") else "desconocido"
+    out = {"accion": accion}
+    if accion == "agregar":
+        producto = (intent.get("producto") or fallback_text or "").strip()
+        out["producto"] = producto
+        out["precio_objetivo"] = intent.get("precio_objetivo")
+        out["numero_item"] = intent.get("numero_item")
+        out["query_busqueda"] = (intent.get("query_busqueda") or producto).strip()
+        out["periodicidad_horas"] = intent.get("periodicidad_horas")
+    else:
+        out["numero_item"] = intent.get("numero_item")
+    return out
+
+def load_pending_batch(chat_key: str) -> dict | None:
+    r = get_redis()
+    if r is not None:
+        try:
+            raw = r.get(_redis_pending_batch_key(chat_key))
+            if not raw:
+                return None
+            val = json.loads(raw)
+            return val if isinstance(val, dict) else None
+        except Exception as e:
+            print(f"❌ Redis load_pending_batch failed: {e}")
+            return None
+
+    data = load_watchlist()
+    pending = None
+    if isinstance(data.get("__pending_batch__"), dict):
+        pending = data["__pending_batch__"].get(chat_key)
+    return pending if isinstance(pending, dict) else None
+
+def save_pending_batch(chat_key: str, payload: dict | None):
+    r = get_redis()
+    if r is not None:
+        try:
+            if payload is None:
+                r.delete(_redis_pending_batch_key(chat_key))
+            else:
+                r.set(_redis_pending_batch_key(chat_key), json.dumps(payload, ensure_ascii=False))
+            return
+        except Exception as e:
+            print(f"❌ Redis save_pending_batch failed: {e}")
+
+    data = load_watchlist()
+    if "__pending_batch__" not in data or not isinstance(data.get("__pending_batch__"), dict):
+        data["__pending_batch__"] = {}
+    if payload is None:
+        data["__pending_batch__"].pop(chat_key, None)
+    else:
+        data["__pending_batch__"][chat_key] = payload
+    save_watchlist(data)
 
 # ── Claude: parsear intención ─────────────────────────────────────────────────
 
@@ -531,10 +737,101 @@ def telegram_webhook():
         telegram_send(chat_id, "Dime qué quieres comprar, o escribe: listar")
         return "", 204
 
+    # 1) Normalización previa (sin LLM)
+    norm = normalize_user_message(text)
+    clean_text = norm["clean_text"]
+
+    # Si hay un batch pendiente, este mensaje es parte del flujo (confirmación / periodicidad)
+    pending_batch = load_pending_batch(chat_key)
+    if pending_batch is not None:
+        step = pending_batch.get("step")
+        items = pending_batch.get("items") if isinstance(pending_batch.get("items"), list) else []
+
+        def _render_items(items_: list[dict]) -> str:
+            lines = []
+            for i, it in enumerate(items_, 1):
+                p = it.get("producto")
+                pr = it.get("precio_objetivo")
+                u = it.get("url")
+                extra = []
+                if pr is not None:
+                    extra.append(f"€{pr}")
+                if u:
+                    extra.append(str(u))
+                tail = (" — " + " | ".join(extra)) if extra else ""
+                lines.append(f"{i}. {p}{tail}")
+            return "\n".join(lines)
+
+        low = clean_text.strip().lower()
+        if step == "await_confirm":
+            if low in ("si", "sí", "s", "ok", "dale", "confirmo", "confirmar"):
+                pending_batch["step"] = "await_periodicity"
+                save_pending_batch(chat_key, pending_batch)
+                telegram_send(
+                    chat_id,
+                    "Perfecto. ¿Cada cuántas horas reviso *todos*?\n"
+                    "Responde por ejemplo: 12 (o 'diario').\n\n"
+                    "Si quieres distinto por producto: responde `1:12h 2:24h 3:6h`."
+                )
+                return "", 204
+            if low in ("no", "n", "cancelar", "cancela"):
+                save_pending_batch(chat_key, None)
+                telegram_send(chat_id, "Listo, cancelé el listado.")
+                return "", 204
+
+            telegram_send(
+                chat_id,
+                "¿Confirmas que agregue este listado? Responde **sí** o **no**.\n\n" + _render_items(items)
+            )
+            return "", 204
+
+        if step == "await_periodicity":
+            per_map = parse_periodicidad_map_from_text(clean_text)
+            per_all = None if per_map else parse_periodicidad_horas_from_text(clean_text)
+            if not per_map and not per_all:
+                telegram_send(
+                    chat_id,
+                    "No entendí la periodicidad. Ejemplos: 12, 24 (diario), o `1:12h 2:24h`."
+                )
+                return "", 204
+
+            chat_watchlist = load_chat_watchlist(chat_key)
+            created_ids = []
+            for i, it in enumerate(items, 1):
+                producto = (it.get("producto") or "").strip()
+                if not producto:
+                    continue
+                periodicidad_horas = (per_map.get(i) if per_map else per_all)
+                item_id = f"{producto[:30].lower().replace(' ', '-')}-{datetime.date.today().isoformat()}-{i}"
+                chat_watchlist[item_id] = {
+                    "producto": producto,
+                    "query_busqueda": it.get("query_busqueda") or producto,
+                    "precio_objetivo": it.get("precio_objetivo"),
+                    "periodicidad_horas": periodicidad_horas,
+                    "mejor_precio_actual": None,
+                    "activo": True,
+                    "agregado": datetime.datetime.now().isoformat(),
+                    "historial": []
+                }
+                created_ids.append(item_id)
+
+            save_chat_watchlist(chat_key, chat_watchlist)
+            save_pending_batch(chat_key, None)
+
+            telegram_send(
+                chat_id,
+                f"✅ Listo! Agregué {len(created_ids)} productos.\n\n"
+                "Buscando precio inicial (puede tardar un poco)..."
+            )
+            # Dispara búsquedas iniciales (en background)
+            for iid in created_ids[:10]:
+                check_single_async(chat_key, iid)
+            return "", 204
+
     # Si hay un alta pendiente, esta respuesta se interpreta como periodicidad
     pending = load_pending_add(chat_key)
     if pending is not None:
-        periodicidad_h = parse_periodicidad_horas_from_text(text)
+        periodicidad_h = parse_periodicidad_horas_from_text(clean_text)
         if not periodicidad_h:
             telegram_send(
                 chat_id,
@@ -576,16 +873,68 @@ def telegram_webhook():
         check_single_async(chat_key, item_id)
         return "", 204
 
+    # 2) Comandos simples (sin LLM)
+    if norm["kind"] == "command":
+        cmd = norm["command"]
+        chat_watchlist = load_chat_watchlist(chat_key)
+        if cmd == "listar":
+            telegram_send(chat_id, format_watchlist(chat_watchlist))
+            return "", 204
+        if cmd in ("comprado", "eliminar"):
+            num = norm["number"]
+            active_keys = [k for k, v in chat_watchlist.items() if v.get("activo", True)]
+            if num and 1 <= num <= len(active_keys):
+                iid = active_keys[num - 1]
+                nombre = chat_watchlist[iid]["producto"]
+                chat_watchlist[iid]["activo"] = False
+                chat_watchlist[iid]["fecha_compra"] = datetime.date.today().isoformat()
+                save_chat_watchlist(chat_key, chat_watchlist)
+                telegram_send(chat_id, f"🎉 Listo! Dejé de trackear:\n*{nombre}*\n\n¿Qué más quieres buscar?")
+            else:
+                telegram_send(chat_id, "⚠️ Dime el número. Escribe *listar* para ver tus productos.")
+            return "", 204
+        if cmd == "ayuda":
+            telegram_send(
+                chat_id,
+                "Puedes decirme:\n\n"
+                "- quiero comprar [producto]\n"
+                "- listar\n"
+                "- comprado N\n"
+                "- eliminar N\n\n"
+                "Si mandas un listado (varias líneas), lo agrego en lote."
+            )
+            return "", 204
+
+    # 3) Batch detection (sin LLM para la intención; sí LLM para extraer items)
+    if norm["kind"] == "batch":
+        items = parse_batch_items_with_claude(clean_text)
+        if not items:
+            telegram_send(chat_id, "No pude extraer los productos del listado. ¿Puedes enviarlos uno por línea?")
+            return "", 204
+        save_pending_add(chat_key, None)
+        save_pending_batch(chat_key, {
+            "step": "await_confirm",
+            "items": items,
+            "created_at": datetime.datetime.now().isoformat(),
+        })
+        telegram_send(
+            chat_id,
+            "Detecté este listado. ¿Confirmas que lo agregue? Responde **sí** o **no**.\n\n" +
+            "\n".join([f"{i+1}. {it['producto']}" for i, it in enumerate(items)])
+        )
+        return "", 204
+
+    # 4) Single: usamos LLM para parsear intención
     try:
         chat_watchlist = load_chat_watchlist(chat_key)
-        intent = parse_user_intent(text)
+        intent = coerce_llm_intent(parse_user_intent(clean_text), clean_text)
         accion = intent.get("accion", "desconocido")
     except Exception as e:
         print(f"❌ Error inicializando request: {e}")
         try:
             telegram_send(
                 chat_id,
-                "⚠️ No puedo procesar tu mensaje por configuración faltante.\n"
+                "⚠️ No puedo procesar tu mensaje ahora.\n"
                 "Revisa variables: ANTHROPIC_API_KEY, TAVILY_API_KEY, TELEGRAM_BOT_TOKEN."
             )
         except Exception as send_err:
@@ -593,7 +942,7 @@ def telegram_webhook():
         return "", 204
 
     if accion == "agregar":
-        producto = intent.get("producto", text)
+        producto = intent.get("producto", clean_text)
         query = intent.get("query_busqueda", producto)
         precio_objetivo = intent.get("precio_objetivo")
         periodicidad_horas = intent.get("periodicidad_horas")
