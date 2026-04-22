@@ -463,11 +463,36 @@ def _basic_command_intent(text: str) -> str | None:
     if t in ("help", "/help", "ayuda", "/start", "start"):
         return "ayuda"
     # comprado/eliminar con número
-    if re.match(r"^(comprado|eliminar)\s+\d+\s*$", t):
+    if re.match(r"^(comprado|eliminar)\s+[\d,\s]+\s*$", t):
         return t.split()[0]
     if t.startswith("ubicacion ") or t.startswith("ubicación "):
         return "ubicacion"
     return None
+
+def parse_item_numbers_from_text(text: str) -> list[int] | None:
+    """
+    Acepta:
+      - "2"
+      - "2,3,4"
+      - "2 3 4"
+      - "2, 3, 4"
+    Devuelve lista única y ordenada.
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+    # Extrae todos los enteros en el texto
+    nums = [int(x) for x in re.findall(r"\d+", t)]
+    if not nums:
+        return None
+    # Dedup + sort manteniendo orden de aparición
+    seen = set()
+    out = []
+    for n in nums:
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
 
 def normalize_user_message(text: str) -> dict:
     """
@@ -487,8 +512,9 @@ def normalize_user_message(text: str) -> dict:
     clean = _strip_tracking_params_in_text(raw)
     cmd = _basic_command_intent(clean)
     if cmd in ("comprado", "eliminar"):
-        n = int(clean.split()[1])
-        return {"kind": "command", "command": cmd, "number": n, "clean_text": clean}
+        nums = parse_item_numbers_from_text(clean)
+        # compat: si por alguna razón no parsea, no tratamos como comando válido
+        return {"kind": "command", "command": cmd, "numbers": nums, "clean_text": clean}
     if cmd:
         if cmd == "ubicacion":
             loc = clean.split(" ", 1)[1].strip() if " " in clean else ""
@@ -1000,17 +1026,34 @@ def telegram_webhook():
             telegram_send(chat_id, format_watchlist(chat_watchlist))
             return "", 204
         if cmd in ("comprado", "eliminar"):
-            num = norm["number"]
+            nums = norm.get("numbers") or []
             active_keys = [k for k, v in chat_watchlist.items() if v.get("activo", True)]
-            if num and 1 <= num <= len(active_keys):
-                iid = active_keys[num - 1]
-                nombre = chat_watchlist[iid]["producto"]
-                chat_watchlist[iid]["activo"] = False
-                chat_watchlist[iid]["fecha_compra"] = datetime.date.today().isoformat()
-                save_chat_watchlist(chat_key, chat_watchlist)
-                telegram_send(chat_id, f"🎉 Listo! Dejé de trackear:\n*{nombre}*\n\n¿Qué más quieres buscar?")
+            if not nums:
+                telegram_send(chat_id, "⚠️ Dime el/los números. Ej: `comprado 2` o `comprado 2,3,4`.")
+                return "", 204
+
+            marcados = []
+            fuera_de_rango = []
+            for num in nums:
+                if 1 <= num <= len(active_keys):
+                    iid = active_keys[num - 1]
+                    nombre = chat_watchlist[iid]["producto"]
+                    chat_watchlist[iid]["activo"] = False
+                    chat_watchlist[iid]["fecha_compra"] = datetime.date.today().isoformat()
+                    marcados.append(f"{num}. {nombre}")
+                else:
+                    fuera_de_rango.append(str(num))
+
+            save_chat_watchlist(chat_key, chat_watchlist)
+
+            if marcados:
+                msg = "🎉 Listo! Dejé de trackear:\n" + "\n".join(marcados)
+                if fuera_de_rango:
+                    msg += "\n\n⚠️ Fuera de rango: " + ", ".join(fuera_de_rango)
+                msg += "\n\n¿Qué más quieres buscar?"
+                telegram_send(chat_id, msg)
             else:
-                telegram_send(chat_id, "⚠️ Dime el número. Escribe *listar* para ver tus productos.")
+                telegram_send(chat_id, "⚠️ Los números no coinciden con tu lista. Escribe `listar` y prueba de nuevo.")
             return "", 204
         if cmd == "ayuda":
             telegram_send(
@@ -1122,17 +1165,31 @@ def telegram_webhook():
         reply = format_watchlist(chat_watchlist)
 
     elif accion in ("comprado", "eliminar"):
-        num = intent.get("numero_item")
+        num_raw = intent.get("numero_item")
+        nums = num_raw if isinstance(num_raw, list) else ([num_raw] if isinstance(num_raw, int) else None)
         active_keys = [k for k, v in chat_watchlist.items() if v.get("activo", True)]
-        if num and 1 <= num <= len(active_keys):
-            iid = active_keys[num - 1]
-            nombre = chat_watchlist[iid]["producto"]
-            chat_watchlist[iid]["activo"] = False
-            chat_watchlist[iid]["fecha_compra"] = datetime.date.today().isoformat()
+        if nums:
+            marcados = []
+            fuera_de_rango = []
+            for n in nums:
+                if isinstance(n, int) and 1 <= n <= len(active_keys):
+                    iid = active_keys[n - 1]
+                    nombre = chat_watchlist[iid]["producto"]
+                    chat_watchlist[iid]["activo"] = False
+                    chat_watchlist[iid]["fecha_compra"] = datetime.date.today().isoformat()
+                    marcados.append(f"{n}. {nombre}")
+                else:
+                    fuera_de_rango.append(str(n))
             save_chat_watchlist(chat_key, chat_watchlist)
-            reply = f"🎉 Listo! Dejé de trackear:\n*{nombre}*\n\n¿Qué más quieres buscar?"
+            if marcados:
+                reply = "🎉 Listo! Dejé de trackear:\n" + "\n".join(marcados)
+                if fuera_de_rango:
+                    reply += "\n\n⚠️ Fuera de rango: " + ", ".join(fuera_de_rango)
+                reply += "\n\n¿Qué más quieres buscar?"
+            else:
+                reply = "⚠️ Los números no coinciden con tu lista. Escribe `listar` y prueba de nuevo."
         else:
-            reply = "⚠️ Dime el número. Escribe *listar* para ver tus productos."
+            reply = "⚠️ Dime el/los números. Ej: `comprado 2` o `comprado 2,3,4`."
 
     else:
         reply = (
