@@ -813,31 +813,59 @@ def check_single_async(chat_key: str, item_id: str):
     """Busca precio inicial de un producto recién agregado."""
     def _run():
         import time; time.sleep(3)
-        chat_watchlist = load_chat_watchlist(chat_key)
-        if item_id not in chat_watchlist:
-            return
-        item = chat_watchlist[item_id]
-        settings = load_chat_settings(chat_key)
-        location = settings.get("search_location")
-        raw = search_prices(item["producto"], item.get("query_busqueda", item["producto"]), location=location)
-        prices = extract_prices_with_claude(item["producto"], raw)
-        if prices:
-            best = prices[0]
-            item["mejor_precio_actual"] = best["precio"]
-            item["mejor_tienda"] = best["tienda"]
-            item["mejor_url"] = best["url"]
-            item["historial"] = [{"fecha": datetime.datetime.now().isoformat(), "precio": best["precio"], "tienda": best["tienda"], "url": best["url"]}]
-            chat_watchlist[item_id] = item
-            save_chat_watchlist(chat_key, chat_watchlist)
-            send_message(
-                chat_key,
-                f"✅ Precio inicial encontrado!\n\n"
-                f"🛍️ {item['producto']}\n"
-                f"💰 Mejor precio ahora: €{best['precio']:.2f}\n"
-                f"🏪 {best['tienda']}\n"
-                f"🔗 {best['url']}\n\n"
-                f"Te aviso cuando baje 🔔"
-            )
+        try:
+            chat_watchlist = load_chat_watchlist(chat_key)
+            if item_id not in chat_watchlist:
+                return
+            item = chat_watchlist[item_id]
+            settings = load_chat_settings(chat_key)
+            location = settings.get("search_location")
+
+            raw = search_prices(item["producto"], item.get("query_busqueda", item["producto"]), location=location)
+            prices = extract_prices_with_claude(item["producto"], raw)
+            if prices:
+                best = prices[0]
+                item["mejor_precio_actual"] = best["precio"]
+                item["mejor_tienda"] = best["tienda"]
+                item["mejor_url"] = best["url"]
+                item["historial"] = [{"fecha": datetime.datetime.now().isoformat(), "precio": best["precio"], "tienda": best["tienda"], "url": best["url"]}]
+                chat_watchlist[item_id] = item
+                save_chat_watchlist(chat_key, chat_watchlist)
+                send_message(
+                    chat_key,
+                    f"✅ Precio inicial encontrado!\n\n"
+                    f"🛍️ {item['producto']}\n"
+                    f"💰 Mejor precio ahora: €{best['precio']:.2f}\n"
+                    f"🏪 {best['tienda']}\n"
+                    f"🔗 {best['url']}\n\n"
+                    f"Te aviso cuando baje 🔔"
+                )
+            else:
+                # Feedback explícito: si no hay precios, lo decimos.
+                send_message(
+                    chat_key,
+                    f"⚠️ No encontré un precio claro todavía para:\n{item['producto']}\n\n"
+                    "Lo seguiré revisando según la periodicidad."
+                )
+        except Exception as e:
+            print(f"❌ check_single_async failed: {e}")
+    threading.Thread(target=_run, daemon=True).start()
+
+def check_batch_initial_async(chat_key: str, item_ids: list[str]):
+    """
+    Procesa búsquedas iniciales de un batch de forma secuencial (menos ruido y menos carga).
+    """
+    def _run():
+        import time
+        ok, miss = 0, 0
+        for iid in item_ids:
+            # Reusa la lógica existente (envía mensajes por item)
+            check_single_async(chat_key, iid)
+            # Evita disparar demasiadas búsquedas al mismo tiempo
+            time.sleep(0.6)
+            # No contamos realmente acá porque es async; solo damos un cierre al final
+        time.sleep(2)
+        send_message(chat_key, "✅ Arranqué la búsqueda inicial de tu listado. Te voy mandando resultados a medida que salen.")
     threading.Thread(target=_run, daemon=True).start()
 
 # ── Flask webhook ─────────────────────────────────────────────────────────────
@@ -968,9 +996,8 @@ def telegram_webhook():
                 f"✅ Listo! Agregué {len(created_ids)} productos.\n\n"
                 "Buscando precio inicial (puede tardar un poco)..."
             )
-            # Dispara búsquedas iniciales (en background)
-            for iid in created_ids[:10]:
-                check_single_async(chat_key, iid)
+            # Dispara búsquedas iniciales (en background) de forma controlada
+            check_batch_initial_async(chat_key, created_ids)
             return "", 204
 
     # Si hay un alta pendiente, esta respuesta se interpreta como periodicidad
