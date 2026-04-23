@@ -847,7 +847,8 @@ def fetch_price_from_url(url: str) -> dict | None:
     """
     try:
         host = _domain_from_url(url).lower()
-        skip = os.getenv("HTML_FETCH_SKIP_DOMAINS", "uniqlo.com").lower()
+        # Por defecto no bloqueamos dominios; configura HTML_FETCH_SKIP_DOMAINS si quieres saltarte algunos.
+        skip = os.getenv("HTML_FETCH_SKIP_DOMAINS", "").lower()
         skip_domains = [d.strip() for d in skip.split(",") if d.strip()]
         if any(host == d or host.endswith("." + d) for d in skip_domains):
             if os.getenv("DEBUG_HTML_FETCH") == "1" or os.getenv("DEBUG_TAVILY") == "1":
