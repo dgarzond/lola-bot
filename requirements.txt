@@ -5,3 +5,4 @@ python-dotenv
 apscheduler
 requests
 redis
+scrapegraph-py

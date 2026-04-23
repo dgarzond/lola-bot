@@ -21,6 +21,10 @@ import re
 from urllib.parse import urlparse
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.base import JobLookupError
+try:
+    from scrapegraph_py import Client as ScrapeGraphClient
+except Exception:
+    ScrapeGraphClient = None
 
 try:
     from dotenv import load_dotenv
@@ -970,6 +974,139 @@ def enrich_prices_from_html(producto: str, raw_results: list, existing: list) ->
     out.sort(key=lambda x: x.get("precio", 10**12))
     return out
 
+def scrapegraph_extract_listing(url: str) -> dict | None:
+    """
+    Fallback pesado: usa ScrapeGraphAI para extraer precio/moneda/condición.
+    Requiere SCRAPEGRAPH_API_KEY.
+    """
+    if ScrapeGraphClient is None:
+        return None
+    api_key = os.getenv("SCRAPEGRAPH_API_KEY")
+    if not api_key:
+        return None
+
+    try:
+        client = ScrapeGraphClient(api_key=api_key)
+        prompt = (
+            "Extrae información del producto. Devuelve solo:\n"
+            "- nombre (string)\n"
+            "- precio (number)\n"
+            "- moneda (string, idealmente EUR)\n"
+            "- condicion (\"nuevo\"|\"usado\"|\"reacondicionado\"|null)\n"
+            "- disponible (true/false/null)\n"
+            "- notas (string corto)\n"
+            "Si no hay precio claro, devuelve precio=null."
+        )
+        schema = {
+            "type": "object",
+            "properties": {
+                "nombre": {"type": ["string", "null"]},
+                "precio": {"type": ["number", "null"]},
+                "moneda": {"type": ["string", "null"]},
+                "condicion": {"type": ["string", "null"]},
+                "disponible": {"type": ["boolean", "null"]},
+                "notas": {"type": ["string", "null"]},
+            },
+        }
+        resp = client.smartscraper(
+            website_url=url,
+            user_prompt=prompt,
+            output_schema=schema,
+        )
+        data = resp if isinstance(resp, dict) else {}
+
+        price = data.get("precio")
+        price = float(price) if isinstance(price, (int, float)) else None
+        currency = data.get("moneda") or "EUR"
+        cond = (data.get("condicion") or "").lower()
+        if cond in ("used", "usado", "segunda mano"):
+            cond = "usado"
+        if cond in ("refurbished", "reacondicionado", "refurb"):
+            cond = "reacondicionado"
+        if cond in ("new", "nuevo"):
+            cond = "nuevo"
+        cond = cond or None
+
+        return {
+            "tienda": _domain_from_url(url) or "Web",
+            "precio": price,
+            "moneda": currency,
+            "url": url,
+            "descripcion": data.get("nombre"),
+            "disponible": data.get("disponible") if isinstance(data.get("disponible"), bool) else True,
+            "condicion": cond,
+            "notas": data.get("notas"),
+        }
+    except Exception as e:
+        if os.getenv("DEBUG_SCRAPEGRAPH") == "1":
+            print(f"❌ scrapegraph_extract_listing failed: {type(e).__name__}: {e}")
+        return None
+
+def claude_filter_listings(producto: str, listings: list[dict]) -> list[dict]:
+    """
+    Usa Claude para filtrar/normalizar listings (y excluir usados) cuando vienen de scrapers.
+    """
+    if not listings:
+        return []
+    client = anthropic.Anthropic(api_key=require_env("ANTHROPIC_API_KEY"))
+    prompt = (
+        f"Producto objetivo: {producto}\n\n"
+        f"Listings candidatos (JSON):\n{json.dumps(listings, ensure_ascii=False)}\n\n"
+        "Devuelve SOLO JSON array con objetos:\n"
+        "[{\"tienda\":string,\"precio\":number,\"moneda\":\"EUR\",\"url\":string,\"descripcion\":string,\"disponible\":true|false}]\n\n"
+        "Reglas:\n"
+        "- Excluye usados/segunda mano/reacondicionados.\n"
+        "- Mantén solo precios numéricos claros.\n"
+        "- Ordena de menor a mayor.\n"
+        "- Si ninguno sirve, devuelve []."
+    )
+    resp = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=800,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    text = resp.content[0].text.strip().strip("```json").strip("```").strip()
+    try:
+        arr = json.loads(text)
+        return arr if isinstance(arr, list) else []
+    except Exception:
+        return []
+
+def enrich_prices_with_scrapegraph(producto: str, raw_results: list, existing: list) -> list:
+    """
+    Último recurso: si no hay precios, usa ScrapeGraphAI en 1-2 URLs y filtra con Claude.
+    """
+    if existing:
+        return existing
+    if os.getenv("USE_SCRAPEGRAPH_FALLBACK", "0") != "1":
+        return existing
+
+    urls = []
+    for r in raw_results[:3]:
+        u = r.get("url")
+        if isinstance(u, str) and u:
+            urls.append(u)
+
+    max_urls = int(os.getenv("SCRAPEGRAPH_MAX_URLS", "2"))
+    urls = urls[:max_urls]
+
+    extracted = []
+    for u in urls:
+        # respeta filtro de usados por texto/dominio antes de gastar scraping
+        if os.getenv("EXCLUDE_USED_RESULTS", "1") == "1" and looks_used_listing(None, None, u):
+            continue
+        listing = scrapegraph_extract_listing(u)
+        if not listing:
+            continue
+        # si ya dice usado/reacondicionado, descartamos
+        cond = (listing.get("condicion") or "").lower()
+        if os.getenv("EXCLUDE_USED_RESULTS", "1") == "1" and cond in ("usado", "reacondicionado"):
+            continue
+        if isinstance(listing.get("precio"), (int, float)):
+            extracted.append(listing)
+
+    return claude_filter_listings(producto, extracted)
+
 def extract_prices(producto: str, raw_results: list) -> list:
     """
     Pipeline: primero Claude sobre snippets; si no hay precios, intenta HTML directo.
@@ -983,7 +1120,10 @@ def extract_prices(producto: str, raw_results: list) -> list:
     prices = extract_prices_with_claude(producto, filtered)
     if prices:
         return prices
-    return enrich_prices_from_html(producto, filtered, prices)
+    prices = enrich_prices_from_html(producto, filtered, prices)
+    if prices:
+        return prices
+    return enrich_prices_with_scrapegraph(producto, filtered, prices)
 
 # ── Mensajería ────────────────────────────────────────────────────────────────
 
