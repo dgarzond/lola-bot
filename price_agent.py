@@ -649,7 +649,7 @@ def search_prices(producto: str, query: str, location: str | None = None) -> lis
     neg = ""
     if exclude_used:
         # Tavily usa motores web: estos términos ayudan a filtrar marketplaces/2da mano.
-        neg = " -usado -usada -segunda_mano -\"segunda mano\" -reacondicionado -refurbished -refurb -wallapop -ebay"
+        neg = " -usado -usada -segunda_mano -\"segunda mano\" -reacondicionado -refurbished -refurb -wallapop -ebay -vinted -milanuncios -todocoleccion -vintage -antiguo -antigua -lote"
 
     queries = [
         _cap(f"{query}{loc_suffix}{neg}"),
@@ -668,7 +668,13 @@ def search_prices(producto: str, query: str, location: str | None = None) -> lis
                 res = resp.get("results", []) or []
                 n = len(res)
                 print(f"🔎 Tavily query ({n} results): {q[:160]}")
-                for i, r in enumerate(res[:3], 1):
+                if exclude_used:
+                    kept = [r for r in res if not looks_used_listing(r.get("title"), r.get("content"), r.get("url"))]
+                    print(f"   filtered_used: kept {len(kept)}/{len(res)}")
+                    res_to_print = kept
+                else:
+                    res_to_print = res
+                for i, r in enumerate(res_to_print[:3], 1):
                     url = (r.get("url") or "").strip()
                     title = (r.get("title") or "").strip()
                     try:
@@ -679,6 +685,8 @@ def search_prices(producto: str, query: str, location: str | None = None) -> lis
                     print(f"      {url[:200]}")
             for r in resp.get("results", []) or []:
                 url = r.get("url")
+                if exclude_used and looks_used_listing(r.get("title"), r.get("content"), url):
+                    continue
                 if url and url not in seen:
                     seen.add(url)
                     results.append(r)
@@ -727,6 +735,27 @@ def _domain_from_url(url: str) -> str:
         return urlparse(url).netloc or ""
     except Exception:
         return ""
+
+USED_KEYWORDS = (
+    "usado", "usada", "segunda mano", "2da mano", "segundamano",
+    "reacondicionado", "reacondicionada", "refurbished", "refurb",
+    "pre-owned", "preowned", "reconditioned",
+    "vintage", "antiguo", "antigua", "antiguos", "antiguas", "lote", "colección", "coleccion",
+)
+
+USED_DOMAINS = (
+    "ebay.", "wallapop.", "vinted.", "milanuncios.", "facebook.com/marketplace",
+    "todocoleccion.",
+)
+
+def looks_used_listing(title: str | None, content: str | None, url: str | None) -> bool:
+    t = (title or "").lower()
+    c = (content or "").lower()
+    u = (url or "").lower()
+    if any(d in u for d in USED_DOMAINS):
+        return True
+    blob = f"{t}\n{c}\n{u}"
+    return any(k in blob for k in USED_KEYWORDS)
 
 def _to_float_price(val) -> float | None:
     try:
@@ -860,9 +889,12 @@ def enrich_prices_from_html(producto: str, raw_results: list, existing: list) ->
     if existing:
         return existing
     urls = []
-    for r in raw_results[:3]:
+    exclude_used = os.getenv("EXCLUDE_USED_RESULTS", "1") == "1"
+    for r in raw_results[:5]:
         u = r.get("url")
         if u and isinstance(u, str):
+            if exclude_used and looks_used_listing(r.get("title"), r.get("content"), u):
+                continue
             urls.append(u)
     out = []
     seen = set()
@@ -881,10 +913,16 @@ def extract_prices(producto: str, raw_results: list) -> list:
     """
     Pipeline: primero Claude sobre snippets; si no hay precios, intenta HTML directo.
     """
-    prices = extract_prices_with_claude(producto, raw_results)
+    # Filtra usados antes de pasarle a Claude / HTML.
+    exclude_used = os.getenv("EXCLUDE_USED_RESULTS", "1") == "1"
+    filtered = raw_results
+    if exclude_used and raw_results:
+        filtered = [r for r in raw_results if not looks_used_listing(r.get("title"), r.get("content"), r.get("url"))]
+
+    prices = extract_prices_with_claude(producto, filtered)
     if prices:
         return prices
-    return enrich_prices_from_html(producto, raw_results, prices)
+    return enrich_prices_from_html(producto, filtered, prices)
 
 # ── Mensajería ────────────────────────────────────────────────────────────────
 
