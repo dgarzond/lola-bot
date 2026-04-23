@@ -19,6 +19,8 @@ import redis
 from redis.exceptions import AuthenticationError, RedisError
 import re
 from urllib.parse import urlparse
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.jobstores.base import JobLookupError
 
 try:
     from dotenv import load_dotenv
@@ -844,11 +846,47 @@ def fetch_price_from_url(url: str) -> dict | None:
     Devuelve un listing compatible con extract_prices_with_claude o None.
     """
     try:
+        host = _domain_from_url(url).lower()
+        skip = os.getenv("HTML_FETCH_SKIP_DOMAINS", "uniqlo.com").lower()
+        skip_domains = [d.strip() for d in skip.split(",") if d.strip()]
+        if any(host == d or host.endswith("." + d) for d in skip_domains):
+            if os.getenv("DEBUG_HTML_FETCH") == "1" or os.getenv("DEBUG_TAVILY") == "1":
+                print(f"⏭️  HTML fetch skipped for domain: {host}")
+            return None
+
         headers = {
             "User-Agent": "Mozilla/5.0 (compatible; LolaBot/1.0; +https://github.com/dgarzond/lola-bot)",
             "Accept": "text/html,application/xhtml+xml",
         }
-        r = requests.get(url, headers=headers, timeout=15)
+
+        # timeouts más agresivos para no bloquear el bot (connect, read)
+        connect_timeout = float(os.getenv("HTML_FETCH_CONNECT_TIMEOUT_S", "3.0"))
+        read_timeout = float(os.getenv("HTML_FETCH_READ_TIMEOUT_S", "8.0"))
+        retries = int(os.getenv("HTML_FETCH_RETRIES", "1"))
+
+        last_err = None
+        for attempt in range(retries + 1):
+            try:
+                r = requests.get(url, headers=headers, timeout=(connect_timeout, read_timeout))
+                break
+            except requests.exceptions.ReadTimeout as e:
+                last_err = e
+                if os.getenv("DEBUG_HTML_FETCH") == "1" or os.getenv("DEBUG_TAVILY") == "1":
+                    print(f"⏱️  HTML fetch ReadTimeout (attempt {attempt+1}/{retries+1}) for {host}")
+            except requests.exceptions.ConnectTimeout as e:
+                last_err = e
+                if os.getenv("DEBUG_HTML_FETCH") == "1" or os.getenv("DEBUG_TAVILY") == "1":
+                    print(f"⏱️  HTML fetch ConnectTimeout (attempt {attempt+1}/{retries+1}) for {host}")
+            except requests.exceptions.RequestException as e:
+                last_err = e
+                break
+        else:
+            # no debería llegar acá
+            return None
+
+        if last_err is not None and 'r' not in locals():
+            return None
+
         if r.status_code >= 400:
             return None
 
@@ -969,7 +1007,189 @@ def format_watchlist(watchlist: dict) -> str:
     lines.append("\n_Responde *comprado N* para marcar como comprado_")
     return "\n".join(lines)
 
-# ── Check precios (corre 4x/día) ──────────────────────────────────────────────
+# ── Scheduler per-item (según periodicidad) ───────────────────────────────────
+
+SCHEDULER: BackgroundScheduler | None = None
+
+def utcnow() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+def _job_id(chat_key: str, item_id: str) -> str:
+    return f"item:{chat_key}:{item_id}"
+
+def get_scheduler() -> BackgroundScheduler | None:
+    return SCHEDULER
+
+def check_item_job(chat_key: str, item_id: str):
+    """
+    Job: revisa un solo item y manda alertas si corresponde.
+    """
+    chat_watchlist = load_chat_watchlist(chat_key)
+    item = chat_watchlist.get(item_id)
+    if not isinstance(item, dict) or not item.get("activo", True):
+        # Item ya no existe o está inactivo -> intenta remover el job
+        sch = get_scheduler()
+        if sch:
+            try:
+                sch.remove_job(_job_id(chat_key, item_id))
+            except Exception:
+                pass
+        return
+
+    settings = load_chat_settings(chat_key)
+    location = settings.get("search_location")
+
+    prev_precio = item.get("mejor_precio_actual")
+    now_iso = datetime.datetime.now().isoformat()
+
+    raw = search_prices(item["producto"], item.get("query_busqueda", item["producto"]), location=location)
+    prices = extract_prices(item["producto"], raw)
+
+    item["ultima_revision"] = now_iso
+
+    periodicidad_h = item.get("periodicidad_horas")
+    if periodicidad_h:
+        try:
+            seconds = max(60, int(float(periodicidad_h) * 3600))
+            item["next_run_at"] = (utcnow() + datetime.timedelta(seconds=seconds)).isoformat()
+        except Exception:
+            pass
+
+    if not prices:
+        chat_watchlist[item_id] = item
+        save_chat_watchlist(chat_key, chat_watchlist)
+        return
+
+    best = prices[0]
+    nuevo_precio = best["precio"]
+
+    if "historial" not in item:
+        item["historial"] = []
+    item["historial"].append({
+        "fecha": now_iso,
+        "precio": nuevo_precio,
+        "tienda": best["tienda"],
+        "url": best["url"]
+    })
+    item["mejor_precio_actual"] = nuevo_precio
+    item["mejor_tienda"] = best["tienda"]
+    item["mejor_url"] = best["url"]
+
+    # Alertas
+    if prev_precio is not None and nuevo_precio < prev_precio:
+        bajada = prev_precio - nuevo_precio
+        pct = (bajada / prev_precio) * 100 if prev_precio else 0
+        msg = (
+            f"🔔 Bajada de precio!\n\n"
+            f"🛍️ {item['producto']}\n"
+            f"💰 €{nuevo_precio:.2f} (antes €{prev_precio:.2f})\n"
+            f"📉 Bajó €{bajada:.2f} ({pct:.1f}%)\n"
+            f"🏪 {best['tienda']}\n"
+            f"🔗 {best['url']}"
+        )
+        send_message(chat_key, msg)
+
+    if item.get("precio_objetivo") and nuevo_precio <= item["precio_objetivo"]:
+        msg = (
+            f"🎯 Precio objetivo alcanzado!\n\n"
+            f"🛍️ {item['producto']}\n"
+            f"💰 €{nuevo_precio:.2f} (tu objetivo: €{item['precio_objetivo']})\n"
+            f"🏪 {best['tienda']}\n"
+            f"🔗 {best['url']}"
+        )
+        send_message(chat_key, msg)
+
+    chat_watchlist[item_id] = item
+    save_chat_watchlist(chat_key, chat_watchlist)
+
+def schedule_item_job(chat_key: str, item_id: str, periodicidad_horas: float):
+    sch = get_scheduler()
+    if not sch:
+        return
+
+    seconds = max(60, int(float(periodicidad_horas) * 3600))
+    next_run = utcnow() + datetime.timedelta(seconds=seconds)
+
+    sch.add_job(
+        check_item_job,
+        "interval",
+        id=_job_id(chat_key, item_id),
+        seconds=seconds,
+        next_run_time=next_run,
+        replace_existing=True,
+        args=[chat_key, item_id],
+        misfire_grace_time=3600,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Persistimos next_run_at en storage
+    chat_watchlist = load_chat_watchlist(chat_key)
+    if item_id in chat_watchlist and isinstance(chat_watchlist[item_id], dict):
+        chat_watchlist[item_id]["next_run_at"] = next_run.isoformat()
+        save_chat_watchlist(chat_key, chat_watchlist)
+
+def unschedule_item_job(chat_key: str, item_id: str):
+    sch = get_scheduler()
+    if not sch:
+        return
+    try:
+        sch.remove_job(_job_id(chat_key, item_id))
+    except JobLookupError:
+        pass
+    except Exception:
+        pass
+
+def bootstrap_jobs_from_storage():
+    """
+    Reconstruye jobs desde Redis/archivo al arrancar (para sobrevivir redeploys).
+    """
+    sch = get_scheduler()
+    if not sch:
+        return
+
+    data = load_watchlist()
+    now = utcnow()
+
+    for chat_key, chat_watchlist in (data or {}).items():
+        if not isinstance(chat_watchlist, dict):
+            continue
+        for item_id, item in chat_watchlist.items():
+            if not isinstance(item, dict) or not item.get("activo", True):
+                continue
+            periodicidad_h = item.get("periodicidad_horas")
+            if not periodicidad_h:
+                continue
+            try:
+                seconds = max(60, int(float(periodicidad_h) * 3600))
+            except Exception:
+                continue
+
+            # next_run_time: si hay next_run_at futuro, úsalo; sino desde ahora.
+            next_run = now + datetime.timedelta(seconds=seconds)
+            try:
+                nra = item.get("next_run_at")
+                if isinstance(nra, str) and nra:
+                    dt = datetime.datetime.fromisoformat(nra)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=datetime.timezone.utc)
+                    if dt > now:
+                        next_run = dt
+            except Exception:
+                pass
+
+            sch.add_job(
+                check_item_job,
+                "interval",
+                id=_job_id(str(chat_key), str(item_id)),
+                seconds=seconds,
+                next_run_time=next_run,
+                replace_existing=True,
+                args=[str(chat_key), str(item_id)],
+                misfire_grace_time=3600,
+                max_instances=1,
+                coalesce=True,
+            )
 
 def check_all_prices():
     """Job del scheduler — revisa todos los productos y manda alertas."""
@@ -1314,6 +1534,15 @@ def telegram_webhook():
             save_chat_watchlist(chat_key, chat_watchlist)
             save_pending_batch(chat_key, None)
 
+            # Agenda jobs por item según periodicidad
+            for iid in created_ids:
+                it = chat_watchlist.get(iid)
+                if isinstance(it, dict) and it.get("periodicidad_horas"):
+                    try:
+                        schedule_item_job(chat_key, iid, float(it["periodicidad_horas"]))
+                    except Exception:
+                        pass
+
             telegram_send(
                 chat_id,
                 f"✅ Listo! Agregué {len(created_ids)} productos.\n\n"
@@ -1357,6 +1586,12 @@ def telegram_webhook():
         }
         save_chat_watchlist(chat_key, chat_watchlist)
         save_pending_add(chat_key, None)
+
+        # Agenda job por item (desde ahora + periodicidad)
+        try:
+            schedule_item_job(chat_key, item_id, float(periodicidad_h))
+        except Exception:
+            pass
 
         obj_str = f"\n🎯 Precio objetivo: €{precio_objetivo}" if precio_objetivo else ""
         reply = (
@@ -1404,6 +1639,10 @@ def telegram_webhook():
                     chat_watchlist[iid]["activo"] = False
                     chat_watchlist[iid]["fecha_compra"] = datetime.date.today().isoformat()
                     marcados.append(f"{num}. {nombre}")
+                    try:
+                        unschedule_item_job(chat_key, iid)
+                    except Exception:
+                        pass
                 else:
                     fuera_de_rango.append(str(num))
 
@@ -1534,6 +1773,10 @@ def telegram_webhook():
                     chat_watchlist[iid]["activo"] = False
                     chat_watchlist[iid]["fecha_compra"] = datetime.date.today().isoformat()
                     marcados.append(f"{n}. {nombre}")
+                    try:
+                        unschedule_item_job(chat_key, iid)
+                    except Exception:
+                        pass
                 else:
                     fuera_de_rango.append(str(n))
             save_chat_watchlist(chat_key, chat_watchlist)
@@ -1571,11 +1814,11 @@ def health():
 # ── Main: arranca Flask + Scheduler juntos ────────────────────────────────────
 
 if __name__ == "__main__":
-    # Scheduler: revisar precios 4 veces al día (8, 14, 20, 2)
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(check_all_prices, "cron", hour="8,14,20,2", minute=0)
-    scheduler.start()
-    print("⏰ Scheduler activo — revisará precios a las 8, 14, 20 y 2h")
+    # Scheduler: jobs por producto según periodicidad_horas
+    SCHEDULER = BackgroundScheduler()
+    SCHEDULER.start()
+    bootstrap_jobs_from_storage()
+    print("⏰ Scheduler activo — jobs por producto (según periodicidad)")
 
     port = int(os.environ.get("PORT", 5001))
     print(f"🌐 Webhook en puerto {port}")
