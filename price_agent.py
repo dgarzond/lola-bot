@@ -654,13 +654,18 @@ def search_prices(producto: str, query: str, location: str | None = None) -> lis
             continue
         try:
             resp = client.search(q, max_results=6) or {}
+            if os.getenv("DEBUG_TAVILY") == "1":
+                n = len(resp.get("results", []) or [])
+                print(f"🔎 Tavily query ({n} results): {q[:160]}")
             for r in resp.get("results", []) or []:
                 url = r.get("url")
                 if url and url not in seen:
                     seen.add(url)
                     results.append(r)
-        except Exception:
-            pass
+        except Exception as e:
+            if os.getenv("DEBUG_TAVILY") == "1":
+                print(f"❌ Tavily search error for query: {q[:160]}")
+                print(f"   {type(e).__name__}: {e}")
 
     return results
 
