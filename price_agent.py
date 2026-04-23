@@ -18,6 +18,7 @@ import requests
 import redis
 from redis.exceptions import AuthenticationError, RedisError
 import re
+from urllib.parse import urlparse
 
 try:
     from dotenv import load_dotenv
@@ -643,11 +644,18 @@ def search_prices(producto: str, query: str, location: str | None = None) -> lis
             cut = max_q
         return s[:cut].strip()
 
+    # Evitar resultados usados/reacondicionados por defecto
+    exclude_used = os.getenv("EXCLUDE_USED_RESULTS", "1") == "1"
+    neg = ""
+    if exclude_used:
+        # Tavily usa motores web: estos términos ayudan a filtrar marketplaces/2da mano.
+        neg = " -usado -usada -segunda_mano -\"segunda mano\" -reacondicionado -refurbished -refurb -wallapop -ebay"
+
     queries = [
-        _cap(f"{query}{loc_suffix}"),
-        _cap(f"{producto} precio{loc_suffix}"),
-        _cap(f"{query} comprar{loc_suffix}"),
-        _cap(f"{query} oferta precio{loc_suffix}"),
+        _cap(f"{query}{loc_suffix}{neg}"),
+        _cap(f"{producto} precio{loc_suffix}{neg}"),
+        _cap(f"{query} comprar{loc_suffix}{neg}"),
+        _cap(f"{query} oferta precio{loc_suffix}{neg}"),
     ]
 
     seen, results = set(), []
@@ -687,7 +695,7 @@ def extract_prices_with_claude(producto: str, raw_results: list) -> list:
 
     client = anthropic.Anthropic(api_key=require_env("ANTHROPIC_API_KEY"))
     results_text = "\n\n".join([
-        f"URL: {r.get('url')}\nTítulo: {r.get('title')}\nContenido: {r.get('content','')[:500]}"
+        f"URL: {r.get('url')}\nTítulo: {r.get('title')}\nContenido: {r.get('content','')[:2000]}"
         for r in raw_results
     ])
 
@@ -698,7 +706,9 @@ def extract_prices_with_claude(producto: str, raw_results: list) -> list:
 Extrae listings reales con precio. Responde SOLO JSON array (sin markdown):
 [{{"tienda":"Amazon","precio":89.99,"moneda":"EUR","url":"https://...","descripcion":"nombre producto","disponible":true}}]
 
-Solo precios numéricos claros. Ordena menor a mayor. Si no hay, devuelve []."""
+Reglas:
+- Excluye productos usados/segunda mano/reacondicionados (used, pre-owned, refurbished, reacondicionado, segunda mano).
+- Solo precios numéricos claros. Ordena menor a mayor. Si no hay, devuelve []."""
 
     resp = client.messages.create(
         model="claude-sonnet-4-6",
@@ -707,9 +717,174 @@ Solo precios numéricos claros. Ordena menor a mayor. Si no hay, devuelve []."""
     )
     text = resp.content[0].text.strip().strip("```json").strip("```").strip()
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, list) else []
     except Exception:
         return []
+
+def _domain_from_url(url: str) -> str:
+    try:
+        return urlparse(url).netloc or ""
+    except Exception:
+        return ""
+
+def _to_float_price(val) -> float | None:
+    try:
+        if isinstance(val, (int, float)):
+            return float(val)
+        if not isinstance(val, str):
+            return None
+        s = val.strip()
+        s = s.replace("\u00a0", " ")
+        # quita símbolos típicos
+        s = s.replace("€", "").replace("EUR", "").strip()
+        # soporta 1.234,56 o 1,234.56
+        # si hay ambas, asumimos que la última separa decimales
+        if "," in s and "." in s:
+            if s.rfind(",") > s.rfind("."):
+                s = s.replace(".", "").replace(",", ".")
+            else:
+                s = s.replace(",", "")
+        else:
+            s = s.replace(",", ".")
+        m = re.search(r"(\d+(?:\.\d+)?)", s)
+        if not m:
+            return None
+        return float(m.group(1))
+    except Exception:
+        return None
+
+def _extract_price_from_jsonld(obj) -> tuple[float | None, str | None]:
+    # Devuelve (price, currency)
+    if isinstance(obj, list):
+        for x in obj:
+            p, c = _extract_price_from_jsonld(x)
+            if p is not None:
+                return p, c
+        return None, None
+
+    if not isinstance(obj, dict):
+        return None, None
+
+    offers = obj.get("offers")
+    if offers is not None:
+        p, c = _extract_price_from_jsonld(offers)
+        if p is not None:
+            return p, c
+
+    # offer directo
+    price = obj.get("price") or obj.get("lowPrice")
+    currency = obj.get("priceCurrency")
+    p = _to_float_price(price)
+    if p is not None:
+        return p, currency
+
+    # a veces está anidado
+    for k in ("mainEntity", "itemOffered", "product", "data"):
+        if k in obj:
+            p, c = _extract_price_from_jsonld(obj.get(k))
+            if p is not None:
+                return p, c
+    return None, None
+
+def fetch_price_from_url(url: str) -> dict | None:
+    """
+    Intenta extraer precio desde HTML (JSON-LD / meta tags / itemprop).
+    Devuelve un listing compatible con extract_prices_with_claude o None.
+    """
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; LolaBot/1.0; +https://github.com/dgarzond/lola-bot)",
+            "Accept": "text/html,application/xhtml+xml",
+        }
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code >= 400:
+            return None
+
+        html = r.text
+        # Limita trabajo
+        if len(html) > 1_200_000:
+            html = html[:1_200_000]
+
+        # 1) JSON-LD
+        for m in re.finditer(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, re.I | re.S):
+            raw = m.group(1).strip()
+            if not raw:
+                continue
+            # algunos sitios ponen múltiples JSONs
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
+            price, currency = _extract_price_from_jsonld(data)
+            if price is not None:
+                return {
+                    "tienda": _domain_from_url(url) or "Web",
+                    "precio": float(price),
+                    "moneda": currency or "EUR",
+                    "url": url,
+                    "descripcion": None,
+                    "disponible": True,
+                }
+
+        # 2) Meta tags comunes
+        meta_patterns = [
+            r'<meta[^>]+property=["\']product:price:amount["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+property=["\']og:price:amount["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+itemprop=["\']price["\'][^>]+content=["\']([^"\']+)["\']',
+        ]
+        for pat in meta_patterns:
+            mm = re.search(pat, html, re.I)
+            if mm:
+                price = _to_float_price(mm.group(1))
+                if price is not None:
+                    return {
+                        "tienda": _domain_from_url(url) or "Web",
+                        "precio": float(price),
+                        "moneda": "EUR",
+                        "url": url,
+                        "descripcion": None,
+                        "disponible": True,
+                    }
+
+        return None
+    except Exception as e:
+        if os.getenv("DEBUG_TAVILY") == "1":
+            print(f"❌ fetch_price_from_url failed: {type(e).__name__}: {e}")
+        return None
+
+def enrich_prices_from_html(producto: str, raw_results: list, existing: list) -> list:
+    """
+    Si Claude no encontró precios, intenta extraerlos directamente desde 1–3 URLs top.
+    """
+    if existing:
+        return existing
+    urls = []
+    for r in raw_results[:3]:
+        u = r.get("url")
+        if u and isinstance(u, str):
+            urls.append(u)
+    out = []
+    seen = set()
+    for u in urls:
+        if u in seen:
+            continue
+        seen.add(u)
+        listing = fetch_price_from_url(u)
+        if listing and isinstance(listing.get("precio"), (int, float)):
+            out.append(listing)
+    # Ordena por precio si hay
+    out.sort(key=lambda x: x.get("precio", 10**12))
+    return out
+
+def extract_prices(producto: str, raw_results: list) -> list:
+    """
+    Pipeline: primero Claude sobre snippets; si no hay precios, intenta HTML directo.
+    """
+    prices = extract_prices_with_claude(producto, raw_results)
+    if prices:
+        return prices
+    return enrich_prices_from_html(producto, raw_results, prices)
 
 # ── Mensajería ────────────────────────────────────────────────────────────────
 
@@ -780,7 +955,7 @@ def check_all_prices():
 
             # sesgo por ubicación
             raw = search_prices(item["producto"], item.get("query_busqueda", item["producto"]), location=location)
-            prices = extract_prices_with_claude(item["producto"], raw)
+            prices = extract_prices(item["producto"], raw)
 
             if not prices:
                 print(f"    Sin precios encontrados")
@@ -859,7 +1034,7 @@ def check_chat_prices_and_report(chat_key: str):
     for i, (item_id, item) in enumerate(active.items(), 1):
         try:
             raw = search_prices(item["producto"], item.get("query_busqueda", item["producto"]), location=location)
-            prices = extract_prices_with_claude(item["producto"], raw)
+            prices = extract_prices(item["producto"], raw)
             if prices:
                 best = prices[0]
                 nuevo_precio = best["precio"]
@@ -900,7 +1075,7 @@ def check_single_async(chat_key: str, item_id: str):
             location = settings.get("search_location")
 
             raw = search_prices(item["producto"], item.get("query_busqueda", item["producto"]), location=location)
-            prices = extract_prices_with_claude(item["producto"], raw)
+            prices = extract_prices(item["producto"], raw)
             if prices:
                 best = prices[0]
                 item["mejor_precio_actual"] = best["precio"]
