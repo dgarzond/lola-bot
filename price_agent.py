@@ -657,8 +657,18 @@ def search_prices(producto: str, query: str, location: str | None = None) -> lis
         try:
             resp = client.search(q, max_results=6) or {}
             if os.getenv("DEBUG_TAVILY") == "1":
-                n = len(resp.get("results", []) or [])
+                res = resp.get("results", []) or []
+                n = len(res)
                 print(f"🔎 Tavily query ({n} results): {q[:160]}")
+                for i, r in enumerate(res[:3], 1):
+                    url = (r.get("url") or "").strip()
+                    title = (r.get("title") or "").strip()
+                    try:
+                        host = urlsplit(url).netloc
+                    except Exception:
+                        host = ""
+                    print(f"   {i}. {title[:90]} ({host})")
+                    print(f"      {url[:200]}")
             for r in resp.get("results", []) or []:
                 url = r.get("url")
                 if url and url not in seen:
