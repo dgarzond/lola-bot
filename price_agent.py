@@ -462,6 +462,8 @@ def _basic_command_intent(text: str) -> str | None:
         return "listar"
     if t in ("help", "/help", "ayuda", "/start", "start"):
         return "ayuda"
+    if t in ("forzar busqueda", "forzar búsqueda", "buscar ahora", "revisar ahora", "forzar", "forzarbusqueda"):
+        return "forzar_busqueda"
     # comprado/eliminar con número
     if re.match(r"^(comprado|eliminar)\s+[\d,\s]+\s*$", t):
         return t.split()[0]
@@ -828,6 +830,53 @@ def check_all_prices():
     save_watchlist(all_data)
     print(f"   ✅ Revisión completada.")
 
+def check_chat_prices_and_report(chat_key: str):
+    """
+    Fuerza una revisión inmediata solo para un chat y devuelve un resumen por Telegram.
+    """
+    chat_watchlist = load_chat_watchlist(chat_key)
+    active = {k: v for k, v in chat_watchlist.items() if isinstance(v, dict) and v.get("activo", True)}
+    if not active:
+        send_message(chat_key, "📋 No tienes productos activos. Envía lo que quieres comprar para agregarlo.")
+        return
+
+    settings = load_chat_settings(chat_key)
+    location = settings.get("search_location")
+
+    now_iso = datetime.datetime.now().isoformat()
+    lines = [f"🔎 Revisión forzada ({len(active)} productos):"]
+
+    for i, (item_id, item) in enumerate(active.items(), 1):
+        try:
+            raw = search_prices(item["producto"], item.get("query_busqueda", item["producto"]), location=location)
+            prices = extract_prices_with_claude(item["producto"], raw)
+            if prices:
+                best = prices[0]
+                nuevo_precio = best["precio"]
+                item["mejor_precio_actual"] = nuevo_precio
+                item["mejor_tienda"] = best["tienda"]
+                item["mejor_url"] = best["url"]
+                item["ultima_revision"] = now_iso
+                if "historial" not in item:
+                    item["historial"] = []
+                item["historial"].append({
+                    "fecha": now_iso,
+                    "precio": nuevo_precio,
+                    "tienda": best["tienda"],
+                    "url": best["url"]
+                })
+                lines.append(f"{i}. ✅ {item['producto']}\n   💰 €{nuevo_precio:.2f} — {best['tienda']}\n   🔗 {best['url']}")
+            else:
+                item["ultima_revision"] = now_iso
+                lines.append(f"{i}. ⚠️ {item['producto']}\n   Sin precio claro todavía.")
+
+            chat_watchlist[item_id] = item
+        except Exception as e:
+            lines.append(f"{i}. ❌ {item.get('producto','(producto)')}\n   Error buscando: {type(e).__name__}")
+
+    save_chat_watchlist(chat_key, chat_watchlist)
+    send_message(chat_key, "\n\n".join(lines))
+
 def check_single_async(chat_key: str, item_id: str):
     """Busca precio inicial de un producto recién agregado."""
     def _run():
@@ -1070,6 +1119,19 @@ def telegram_webhook():
         chat_watchlist = load_chat_watchlist(chat_key)
         if cmd == "listar":
             telegram_send(chat_id, format_watchlist(chat_watchlist))
+            return "", 204
+        if cmd == "forzar_busqueda":
+            telegram_send(chat_id, "⏳ OK, forzando búsqueda ahora. Te mando un resumen en un momento…")
+            def _run():
+                try:
+                    check_chat_prices_and_report(chat_key)
+                except Exception as e:
+                    print(f"❌ forzar_busqueda failed: {e}")
+                    try:
+                        telegram_send(chat_id, "⚠️ No pude completar la búsqueda forzada. Intenta de nuevo en 1 minuto.")
+                    except Exception:
+                        pass
+            threading.Thread(target=_run, daemon=True).start()
             return "", 204
         if cmd in ("comprado", "eliminar"):
             nums = norm.get("numbers") or []
