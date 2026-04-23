@@ -472,6 +472,28 @@ def _basic_command_intent(text: str) -> str | None:
         return "ubicacion"
     return None
 
+def build_intro_message(settings: dict | None = None) -> str:
+    loc = (settings or {}).get("search_location")
+    loc_line = f"📍 Ubicación actual: {loc}\n\n" if loc else ""
+    return (
+        "Hola! Soy tu asistente de compras.\n"
+        "Te ayudo a trackear precios (nuevo, no usado) y te aviso si baja o llega a tu objetivo.\n\n"
+        f"{loc_line}"
+        "✅ Qué puedo hacer:\n"
+        "- Agregar productos (uno o listado)\n"
+        "- Revisar precios automáticamente cada X horas\n"
+        "- Forzar una revisión ahora\n\n"
+        "🧾 Comandos:\n"
+        "- `listar`\n"
+        "- `comprado 2` o `comprado 2,3,4`\n"
+        "- `eliminar 1`\n"
+        "- `forzar busqueda`\n"
+        "- `ubicacion España` (o `ubicación Madrid`)\n\n"
+        "Ejemplos:\n"
+        "- \"quiero comprar Dr Martens Reeder talla 42 por menos de 140€\"\n"
+        "- (listado) pega varios productos, uno por línea\n"
+    )
+
 def parse_item_numbers_from_text(text: str) -> list[int] | None:
     """
     Acepta:
@@ -1185,6 +1207,16 @@ def telegram_webhook():
     norm = normalize_user_message(text)
     clean_text = norm["clean_text"]
 
+    # Intro 1 vez por chat (no interrumpe /start)
+    try:
+        settings_intro = load_chat_settings(chat_key)
+        if not settings_intro.get("intro_sent"):
+            telegram_send(chat_id, build_intro_message(settings_intro))
+            settings_intro["intro_sent"] = True
+            save_chat_settings(chat_key, settings_intro)
+    except Exception as e:
+        print(f"❌ intro send failed: {e}")
+
     # Si falta ubicación, preguntamos una vez y reanudamos luego
     pending_loc = load_pending_location(chat_key)
     if pending_loc is not None:
@@ -1387,15 +1419,8 @@ def telegram_webhook():
                 telegram_send(chat_id, "⚠️ Los números no coinciden con tu lista. Escribe `listar` y prueba de nuevo.")
             return "", 204
         if cmd == "ayuda":
-            telegram_send(
-                chat_id,
-                "Puedes decirme:\n\n"
-                "- quiero comprar [producto]\n"
-                "- listar\n"
-                "- comprado N\n"
-                "- eliminar N\n\n"
-                "Si mandas un listado (varias líneas), lo agrego en lote."
-            )
+            settings_help = load_chat_settings(chat_key)
+            telegram_send(chat_id, build_intro_message(settings_help))
             return "", 204
         if cmd == "ubicacion":
             loc = (norm.get("location") or "").strip()
