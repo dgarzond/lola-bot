@@ -629,15 +629,29 @@ def search_prices(producto: str, query: str, location: str | None = None) -> lis
     loc = (location or "").strip()
     loc_suffix = f" {loc}" if loc else ""
 
+    max_q = int(os.getenv("TAVILY_QUERY_MAX_CHARS", "400"))
+
+    def _cap(s: str) -> str:
+        s = (s or "").strip()
+        if len(s) <= max_q:
+            return s
+        # corta sin romper palabras demasiado
+        cut = s.rfind(" ", 0, max_q)
+        if cut < 80:
+            cut = max_q
+        return s[:cut].strip()
+
     queries = [
-        f"{query}{loc_suffix}".strip(),
-        f"{producto} precio{loc_suffix}".strip(),
-        f"{query} comprar{loc_suffix}".strip(),
-        f"{query} oferta precio{loc_suffix}".strip(),
+        _cap(f"{query}{loc_suffix}"),
+        _cap(f"{producto} precio{loc_suffix}"),
+        _cap(f"{query} comprar{loc_suffix}"),
+        _cap(f"{query} oferta precio{loc_suffix}"),
     ]
 
     seen, results = set(), []
     for q in queries:
+        if not q:
+            continue
         try:
             resp = client.search(q, max_results=6) or {}
             for r in resp.get("results", []) or []:
