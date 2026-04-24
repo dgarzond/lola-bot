@@ -1264,7 +1264,9 @@ def format_watchlist(watchlist: dict) -> str:
         precio = item.get("mejor_precio_actual")
         precio_str = f"€{precio:.2f} en {item.get('mejor_tienda','?')}" if precio else "buscando..."
         objetivo = f" · objetivo €{item['precio_objetivo']}" if item.get("precio_objetivo") else ""
-        lines.append(f"{i}. *{item['producto']}*\n   💰 {precio_str}{objetivo}")
+        best_url = item.get("mejor_url")
+        link_line = f"\n   🔗 {best_url}" if (precio and best_url) else ""
+        lines.append(f"{i}. *{item['producto']}*\n   💰 {precio_str}{objetivo}{link_line}")
 
     lines.append("\n_Responde *comprado N* para marcar como comprado_")
     return "\n".join(lines)
