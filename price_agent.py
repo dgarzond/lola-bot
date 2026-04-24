@@ -494,37 +494,36 @@ def _basic_command_intent(text: str) -> str | None:
 
 def build_intro_message(settings: dict | None = None) -> str:
     loc = (settings or {}).get("search_location")
-    loc_line = f"📍 Ubicación actual: {loc}\n\n" if loc else ""
+    loc_line = f"📍 Busco precios en: {loc}\n\n" if loc else ""
     return (
-        "Hola! Soy tu asistente de compras.\n"
-        "Te ayudo a trackear precios (nuevo, no usado) y te aviso si baja o llega a tu objetivo.\n\n"
+        "Hola, soy Lola.\n"
+        "Me especializo en encontrar el mejor precio (nuevo, no usado) y avisarte cuando conviene comprar.\n"
+        "Si me das el producto y tu presupuesto, me encargo del resto.\n\n"
         f"{loc_line}"
-        "✅ Qué puedo hacer:\n"
-        "- Agregar productos (uno o listado)\n"
-        "- Revisar precios automáticamente cada X horas\n"
-        "- Forzar una revisión ahora\n\n"
-        "🧾 Comandos:\n"
-        "- `listar` — ver tus productos\n"
-        "- `comprado 2` o `comprado 2,3,4` — marcar como comprado\n"
-        "- `eliminar 1` — dejar de trackear\n"
-        "- `forzar busqueda` — revisar ahora\n"
-        "- `ubicacion España` (o `ubicación Madrid`) — fijar país/ciudad\n\n"
-        "Ejemplos:\n"
-        "- \"quiero comprar Dr Martens Reeder talla 42 por menos de 140€\"\n"
-        "- (listado) pega varios productos, uno por línea\n"
+        "¿Qué hacemos?\n"
+        "- ¿Querés agregar algo para que lo trackee?\n"
+        "- ¿O querés que te muestre tu lista?\n\n"
+        "Atajos (si te gusta escribir directo):\n"
+        "- `listar`\n"
+        "- `forzar busqueda`\n"
+        "- `sincronizacion 2` (cada 2 horas)\n"
+        "- `ubicacion España`\n\n"
+        "Ejemplo:\n"
+        "“Quiero comprar Dr Martens Reeder talla 42 por menos de 140€”\n"
     )
 
 def build_greeting_message(settings: dict | None = None) -> str:
     loc = (settings or {}).get("search_location")
-    loc_line = f"📍 Estoy buscando en: {loc}\n\n" if loc else ""
+    loc_line = f"📍 Ahora mismo estoy buscando en: {loc}\n\n" if loc else ""
     return (
-        "Hola! ¿Cómo puedo ayudarte hoy?\n\n"
+        "Hola! Qué gusto leerte.\n"
+        "¿Qué estás buscando hoy?\n"
+        "Si me pasás el producto (y si tenés, tu precio objetivo), te lo trackeo.\n\n"
         f"{loc_line}"
-        "Puedes decirme por ejemplo:\n"
-        "- \"mostrame\" (para ver tu lista)\n"
-        "- \"quiero cambiar el schedule\" (y te pregunto cada cuántas horas)\n"
-        "- \"quiero comprar ...\" (uno o un listado)\n"
-        "- \"forzar busqueda\" (revisar ahora)\n"
+        "Si querés, podés responder con una de estas:\n"
+        "- “mostrame”\n"
+        "- “forzar busqueda”\n"
+        "- “quiero cambiar el schedule”\n"
     )
 
 def parse_item_numbers_from_text(text: str) -> list[int] | None:
