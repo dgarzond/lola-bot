@@ -797,8 +797,9 @@ def search_prices(producto: str, query: str, location: str | None = None) -> lis
     exclude_used = os.getenv("EXCLUDE_USED_RESULTS", "1") == "1"
     neg = ""
     if exclude_used:
-        # Tavily usa motores web: estos términos ayudan a filtrar marketplaces/2da mano.
-        neg = " -usado -usada -segunda_mano -\"segunda mano\" -reacondicionado -refurbished -refurb -wallapop -ebay -vinted -milanuncios -todocoleccion -vintage -antiguo -antigua -lote"
+        # Tavily usa motores web: estos términos ayudan a filtrar 2da mano/refurb.
+        # Nota: evitamos términos "soft" (vintage/lote/antiguo) porque generan falsos positivos.
+        neg = " -usado -usada -segunda_mano -\"segunda mano\" -reacondicionado -refurbished -refurb -wallapop -ebay -vinted -milanuncios -todocoleccion"
 
     queries = [
         _cap(f"{query}{loc_suffix}{neg}"),
@@ -885,10 +886,14 @@ def _domain_from_url(url: str) -> str:
     except Exception:
         return ""
 
-USED_KEYWORDS = (
+STRONG_USED_KEYWORDS = (
     "usado", "usada", "segunda mano", "2da mano", "segundamano",
     "reacondicionado", "reacondicionada", "refurbished", "refurb",
     "pre-owned", "preowned", "reconditioned",
+)
+
+# "Soft" keywords: en tiendas normales pueden aparecer sin significar usado.
+SOFT_USED_KEYWORDS = (
     "vintage", "antiguo", "antigua", "antiguos", "antiguas", "lote", "colección", "coleccion",
 )
 
@@ -904,7 +909,14 @@ def looks_used_listing(title: str | None, content: str | None, url: str | None) 
     if any(d in u for d in USED_DOMAINS):
         return True
     blob = f"{t}\n{c}\n{u}"
-    return any(k in blob for k in USED_KEYWORDS)
+    # Filtrado fuerte siempre
+    if any(k in blob for k in STRONG_USED_KEYWORDS):
+        return True
+    # Filtrado "soft" solo en dominios típicos de segunda mano (ya cubiertos arriba).
+    # Se deja acá por si en el futuro agregamos más dominios o patrones.
+    if any(k in blob for k in SOFT_USED_KEYWORDS) and any(d in u for d in USED_DOMAINS):
+        return True
+    return False
 
 def _to_float_price(val) -> float | None:
     try:
