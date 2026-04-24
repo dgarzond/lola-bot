@@ -465,8 +465,20 @@ def _basic_command_intent(text: str) -> str | None:
     t = (text or "").strip().lower()
     if not t:
         return None
-    if t in ("listar", "/listar", "lista", "ver", "ver lista"):
+    # Saludos / small talk (para responder más "humano")
+    if re.match(r"^(hola|buenas|buenos dias|buen día|buenas tardes|buenas noches|hey|que tal|qué tal)\b", t):
+        return "greeting"
+
+    # Listar (sinónimos)
+    if t in ("listar", "/listar", "lista", "ver", "ver lista", "mostrame", "muéstrame", "mostrame la lista", "mostrame mi lista", "mostrar", "mostrar lista"):
         return "listar"
+
+    # Cambiar schedule/sync (sinónimos)
+    if "cambiar" in t and ("schedule" in t or "sincron" in t or "frecuencia" in t or "cada" in t):
+        return "sync_jobs"
+    if t.startswith("schedule ") or t.startswith("frecuencia "):
+        return "sync_jobs"
+
     if t in ("help", "/help", "ayuda", "/start", "start"):
         return "ayuda"
     if t in ("forzar busqueda", "forzar búsqueda", "buscar ahora", "revisar ahora", "forzar", "forzarbusqueda"):
@@ -500,6 +512,19 @@ def build_intro_message(settings: dict | None = None) -> str:
         "Ejemplos:\n"
         "- \"quiero comprar Dr Martens Reeder talla 42 por menos de 140€\"\n"
         "- (listado) pega varios productos, uno por línea\n"
+    )
+
+def build_greeting_message(settings: dict | None = None) -> str:
+    loc = (settings or {}).get("search_location")
+    loc_line = f"📍 Estoy buscando en: {loc}\n\n" if loc else ""
+    return (
+        "Hola! ¿Cómo puedo ayudarte hoy?\n\n"
+        f"{loc_line}"
+        "Puedes decirme por ejemplo:\n"
+        "- \"mostrame\" (para ver tu lista)\n"
+        "- \"quiero cambiar el schedule\" (y te pregunto cada cuántas horas)\n"
+        "- \"quiero comprar ...\" (uno o un listado)\n"
+        "- \"forzar busqueda\" (revisar ahora)\n"
     )
 
 def parse_item_numbers_from_text(text: str) -> list[int] | None:
@@ -555,6 +580,8 @@ def normalize_user_message(text: str) -> dict:
         if cmd == "sync_jobs":
             arg = clean.split(" ", 1)[1].strip() if " " in clean else ""
             return {"kind": "command", "command": cmd, "number": None, "clean_text": clean, "sync_arg": arg}
+        if cmd == "greeting":
+            return {"kind": "command", "command": cmd, "number": None, "clean_text": clean}
         return {"kind": "command", "command": cmd, "number": None, "clean_text": clean}
 
     if _looks_like_list_message(clean):
@@ -1753,6 +1780,10 @@ def telegram_webhook():
     if norm["kind"] == "command":
         cmd = norm["command"]
         chat_watchlist = load_chat_watchlist(chat_key)
+        if cmd == "greeting":
+            settings_greet = load_chat_settings(chat_key)
+            telegram_send(chat_id, build_greeting_message(settings_greet))
+            return "", 204
         if cmd == "listar":
             telegram_send(chat_id, format_watchlist(chat_watchlist))
             return "", 204
