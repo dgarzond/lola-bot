@@ -471,6 +471,8 @@ def _basic_command_intent(text: str) -> str | None:
         return "ayuda"
     if t in ("forzar busqueda", "forzar búsqueda", "buscar ahora", "revisar ahora", "forzar", "forzarbusqueda"):
         return "forzar_busqueda"
+    if t.startswith("sincronizacion") or t.startswith("sincronización") or t.startswith("sync "):
+        return "sync_jobs"
     # comprado/eliminar con número
     if re.match(r"^(comprado|eliminar)\s+[\d,\s]+\s*$", t):
         return t.split()[0]
@@ -550,6 +552,9 @@ def normalize_user_message(text: str) -> dict:
         if cmd == "ubicacion":
             loc = clean.split(" ", 1)[1].strip() if " " in clean else ""
             return {"kind": "command", "command": cmd, "number": None, "clean_text": clean, "location": loc}
+        if cmd == "sync_jobs":
+            arg = clean.split(" ", 1)[1].strip() if " " in clean else ""
+            return {"kind": "command", "command": cmd, "number": None, "clean_text": clean, "sync_arg": arg}
         return {"kind": "command", "command": cmd, "number": None, "clean_text": clean}
 
     if _looks_like_list_message(clean):
@@ -1763,6 +1768,44 @@ def telegram_webhook():
                     except Exception:
                         pass
             threading.Thread(target=_run, daemon=True).start()
+            return "", 204
+        if cmd == "sync_jobs":
+            arg = (norm.get("sync_arg") or "").strip()
+            horas = parse_periodicidad_horas_from_text(arg) if arg else None
+            if not horas:
+                telegram_send(
+                    chat_id,
+                    "¿Cada cuántas horas querés que revise *todos* tus productos?\n"
+                    "Ejemplos: `sincronizacion 2`, `sincronizacion 12`, `sincronizacion diario`."
+                )
+                return "", 204
+
+            active_ids = [iid for iid, it in chat_watchlist.items() if isinstance(it, dict) and it.get("activo", True)]
+            if not active_ids:
+                telegram_send(chat_id, "📋 No tenés productos activos. Agregá uno primero.")
+                return "", 204
+
+            updated = 0
+            for iid in active_ids:
+                it = chat_watchlist.get(iid)
+                if not isinstance(it, dict):
+                    continue
+                it["periodicidad_horas"] = float(horas)
+                # resetea el próximo run (se recalcula al schedule)
+                it.pop("next_run_at", None)
+                chat_watchlist[iid] = it
+                try:
+                    schedule_item_job(chat_key, iid, float(horas))
+                except Exception:
+                    pass
+                updated += 1
+
+            save_chat_watchlist(chat_key, chat_watchlist)
+            settings = load_chat_settings(chat_key)
+            settings["default_periodicidad_horas"] = float(horas)
+            save_chat_settings(chat_key, settings)
+
+            telegram_send(chat_id, f"✅ Listo. Actualicé {updated} productos para revisar cada {float(horas):g}h.")
             return "", 204
         if cmd in ("comprado", "eliminar"):
             nums = norm.get("numbers") or []
