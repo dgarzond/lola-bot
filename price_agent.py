@@ -608,6 +608,96 @@ def coerce_llm_intent(intent: dict, fallback_text: str) -> dict:
         out["numero_item"] = intent.get("numero_item")
     return out
 
+def route_intent_with_claude(message: str) -> dict | None:
+    """
+    Router LLM: clasifica el mensaje en intents cerrados para ejecutar comandos
+    sin depender de strings exactos.
+
+    Retorna dict con:
+      {
+        "intent": one of [
+          "greeting","listar","comprado","eliminar","forzar_busqueda",
+          "ubicacion","sync_jobs","agregar_single","agregar_batch","out_of_scope"
+        ],
+        "numbers": [int] | null,
+        "location": str | null,
+        "periodicidad_horas": number | null
+      }
+    """
+    if os.getenv("USE_LLM_ROUTER", "1") != "1":
+        return None
+    msg = (message or "").strip()
+    if not msg:
+        return None
+
+    # evita prompts gigantes
+    msg = msg[:1200]
+
+    client = anthropic.Anthropic(api_key=require_env("ANTHROPIC_API_KEY"))
+    prompt = f"""Eres un router de intents para un bot de tracking de precios.
+
+Mensaje del usuario:
+\"\"\"{msg}\"\"\"
+
+Devuelve SOLO JSON (sin markdown) con este schema:
+{{
+  "intent": "greeting"|"listar"|"comprado"|"eliminar"|"forzar_busqueda"|"ubicacion"|"sync_jobs"|"agregar_single"|"agregar_batch"|"out_of_scope",
+  "numbers": null o array de enteros (para comprado/eliminar),
+  "location": null o string (para ubicacion),
+  "periodicidad_horas": null o número (para sync_jobs; ej diario=24)
+}}
+
+Reglas:
+- Si es saludo: greeting.
+- Si pide ver lo que tiene / mostrar lista: listar.
+- Si dice que compró/eliminar varios: comprado/eliminar con numbers.
+- Si pide revisar ahora: forzar_busqueda.
+- Si quiere cambiar frecuencia/schedule/sincronización: sync_jobs (si no da número, periodicidad_horas=null).
+- Si manda un listado de varios productos (multi-línea): agregar_batch.
+- Si quiere agregar un solo producto: agregar_single.
+- Si no encaja: out_of_scope.
+"""
+
+    resp = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=250,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text = resp.content[0].text.strip().strip("```json").strip("```").strip()
+    try:
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            return None
+        intent = data.get("intent")
+        allowed = {
+            "greeting","listar","comprado","eliminar","forzar_busqueda",
+            "ubicacion","sync_jobs","agregar_single","agregar_batch","out_of_scope"
+        }
+        if intent not in allowed:
+            return None
+        # normaliza fields
+        if "numbers" in data and data["numbers"] is not None:
+            if isinstance(data["numbers"], list):
+                nums = []
+                for n in data["numbers"]:
+                    if isinstance(n, int):
+                        nums.append(n)
+                    elif isinstance(n, float) and n.is_integer():
+                        nums.append(int(n))
+                data["numbers"] = nums or None
+            else:
+                data["numbers"] = None
+        if "periodicidad_horas" in data and data["periodicidad_horas"] is not None:
+            try:
+                data["periodicidad_horas"] = float(data["periodicidad_horas"])
+            except Exception:
+                data["periodicidad_horas"] = None
+        if "location" in data and data["location"] is not None and not isinstance(data["location"], str):
+            data["location"] = None
+        return data
+    except Exception:
+        return None
+
 def load_pending_batch(chat_key: str) -> dict | None:
     r = get_redis()
     if r is not None:
@@ -1609,6 +1699,39 @@ def telegram_webhook():
             save_chat_settings(chat_key, settings_intro)
     except Exception as e:
         print(f"❌ intro send failed: {e}")
+
+    # Router LLM (decide intent; fallback a reglas si falla)
+    routed = route_intent_with_claude(clean_text)
+    if routed and isinstance(routed, dict):
+        intent = routed.get("intent")
+        if intent == "out_of_scope":
+            telegram_send(
+                chat_id,
+                "Lo siento, solo puedo ayudarte con tracking de precios.\n\n"
+                "Prueba con: `listar`, `forzar busqueda`, `comprado 2`, `eliminar 1`, "
+                "`sincronizacion 2`, `ubicacion España`, o pegar un listado de productos."
+            )
+            return "", 204
+
+        # Traduce intent a "norm" para reutilizar handlers existentes.
+        if intent in ("greeting","listar","forzar_busqueda","ubicacion","sync_jobs","comprado","eliminar"):
+            norm = {"kind": "command", "command": None, "clean_text": clean_text}
+            if intent == "greeting":
+                norm["command"] = "greeting"
+            elif intent == "listar":
+                norm["command"] = "listar"
+            elif intent == "forzar_busqueda":
+                norm["command"] = "forzar_busqueda"
+            elif intent == "ubicacion":
+                norm["command"] = "ubicacion"
+                norm["location"] = (routed.get("location") or "").strip()
+            elif intent == "sync_jobs":
+                norm["command"] = "sync_jobs"
+                ph = routed.get("periodicidad_horas")
+                norm["sync_arg"] = (str(int(ph)) if isinstance(ph, (int, float)) and float(ph).is_integer() else (str(ph) if ph else "")).strip()
+            elif intent in ("comprado","eliminar"):
+                norm["command"] = intent
+                norm["numbers"] = routed.get("numbers") or []
 
     # Si falta ubicación, preguntamos una vez y reanudamos luego
     pending_loc = load_pending_location(chat_key)
